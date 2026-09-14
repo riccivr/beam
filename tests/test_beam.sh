@@ -53,17 +53,16 @@ OUTPUT_LOG="$TMP_DIR/beam.log"
 BEAM_PID=$!
 sleep 0.5
 
-# Extract link & token from log
-LINK_LINE=$(grep "Link:" "$OUTPUT_LOG" || true)
-TOKEN=$(grep "Link:" "$OUTPUT_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
+# Extract link & token from log (32 hex chars / 128-bit CSPRNG)
+TOKEN=$(grep "Link:" "$OUTPUT_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
 
-if [ -z "$TOKEN" ] || [ ${#TOKEN} -ne 12 ]; then
-    echo "[FAIL] Could not extract valid 12-char token from output:"
+if [ -z "$TOKEN" ] || [ ${#TOKEN} -ne 32 ]; then
+    echo "[FAIL] Could not extract valid 32-char token from output:"
     cat "$OUTPUT_LOG"
     kill $BEAM_PID 2>/dev/null || true
     exit 1
 fi
-echo "[PASS] Started beam server on port $TEST_PORT, token=$TOKEN (12 hex chars)"
+echo "[PASS] Started beam server on port $TEST_PORT, token=$TOKEN (32 hex chars / 128-bit CSPRNG)"
 
 # 4. Invalid path and invalid token check
 STATUS_404=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$TEST_PORT/badtoken")
@@ -88,8 +87,9 @@ fi
 STREAM_RESP=$(curl -s -i "http://127.0.0.1:$TEST_PORT/$TOKEN")
 if echo "$STREAM_RESP" | grep -q "Content-Type: video/mp4" && \
    echo "$STREAM_RESP" | grep -q "Content-Disposition: inline; filename=\"sample.mp4\"" && \
-   echo "$STREAM_RESP" | grep -q "Accept-Ranges: bytes"; then
-    echo "[PASS] Clean path /$TOKEN returns correct stream headers (video/mp4, inline disposition)"
+   echo "$STREAM_RESP" | grep -q "Accept-Ranges: bytes" && \
+   echo "$STREAM_RESP" | grep -q "Connection: close"; then
+    echo "[PASS] Clean path /$TOKEN returns correct stream headers (video/mp4, inline disposition, Connection: close)"
 else
     echo "[FAIL] Stream headers unexpected:\n$STREAM_RESP"
     kill $BEAM_PID 2>/dev/null || true
@@ -156,12 +156,21 @@ else
     exit 1
 fi
 
-# Invalid range request: bytes=999999-
+# Invalid range requests: out of bounds, backwards range, negative suffix
 STATUS_416=$(curl -s -o /dev/null -w "%{http_code}" -H "Range: bytes=999999-9999999" "http://127.0.0.1:$TEST_PORT/$TOKEN")
 if [ "$STATUS_416" = "416" ]; then
     echo "[PASS] Invalid range returns 416 Range Not Satisfiable"
 else
     echo "[FAIL] Invalid range returned $STATUS_416 instead of 416"
+    kill $BEAM_PID 2>/dev/null || true
+    exit 1
+fi
+
+STATUS_BACKWARDS=$(curl -s -o /dev/null -w "%{http_code}" -H "Range: bytes=100-50" "http://127.0.0.1:$TEST_PORT/$TOKEN")
+if [ "$STATUS_BACKWARDS" = "416" ]; then
+    echo "[PASS] Backwards range 100-50 returns 416"
+else
+    echo "[FAIL] Backwards range returned $STATUS_BACKWARDS instead of 416"
     kill $BEAM_PID 2>/dev/null || true
     exit 1
 fi
@@ -174,6 +183,16 @@ if echo "$HEAD_RESP" | grep -q "HTTP/1.1 200 OK" && \
     echo "[PASS] HEAD request returns proper headers"
 else
     echo "[FAIL] HEAD request response unexpected:\n$HEAD_RESP"
+    kill $BEAM_PID 2>/dev/null || true
+    exit 1
+fi
+
+# Method Not Allowed check (POST)
+STATUS_405=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$TEST_PORT/$TOKEN")
+if [ "$STATUS_405" = "405" ]; then
+    echo "[PASS] POST method returns 405 Method Not Allowed"
+else
+    echo "[FAIL] POST method returned $STATUS_405 instead of 405"
     kill $BEAM_PID 2>/dev/null || true
     exit 1
 fi
@@ -201,7 +220,7 @@ ONESHOT_LOG="$TMP_DIR/oneshot.log"
 ./beam -q -P 9873 -1 "$TEST_TXT" > "$ONESHOT_LOG" 2>&1 &
 BEAM_1_PID=$!
 sleep 0.5
-ONESHOT_TOKEN=$(grep "Link:" "$ONESHOT_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
+ONESHOT_TOKEN=$(grep "Link:" "$ONESHOT_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
 
 curl -s "http://127.0.0.1:9873/$ONESHOT_TOKEN" > /dev/null
 sleep 0.5
@@ -220,7 +239,7 @@ PIPE_LOG="$TMP_DIR/pipe.log"
 echo "$TEST_TXT" | ./beam -q -P 9874 -1 > "$PIPE_LOG" 2>&1 &
 PIPE_PID=$!
 sleep 0.5
-PIPE_TOKEN=$(grep "Link:" "$PIPE_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
+PIPE_TOKEN=$(grep "Link:" "$PIPE_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
 if [ -n "$PIPE_TOKEN" ]; then
     curl -s "http://127.0.0.1:9874/$PIPE_TOKEN" > /dev/null
     echo "[PASS] Piped filepath correctly picked up and served"
@@ -237,7 +256,7 @@ AUTODUB_LOG="$TMP_DIR/autodub_pipe.log"
 printf "[1/6] Preparing media...\n[6/6] Remuxing final video...\nCompleted:\n  Dubbed: %s\n  Subs: %s\nDone!\n" "$TEST_MP4" "$TEST_SRT" | ./beam -q -P 9875 -1 > "$AUTODUB_LOG" 2>&1 &
 AD_PID=$!
 sleep 0.5
-AD_TOKEN=$(grep "Link:" "$AUTODUB_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
+AD_TOKEN=$(grep "Link:" "$AUTODUB_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
 if [ -n "$AD_TOKEN" ]; then
     RESP=$(curl -s -i "http://127.0.0.1:9875/$AD_TOKEN")
     if echo "$RESP" | grep -q "video/mp4" && echo "$RESP" | grep -q "sample.mp4"; then
@@ -270,7 +289,164 @@ else
 fi
 kill $HOST_PID 2>/dev/null || true
 
-# 14. Ephemeral public tunnel flag (-p) test
+# 14. Empty file + Connection: close + 416 on Range
+echo "Testing empty file and Connection: close..."
+EMPTY="$TMP_DIR/empty.bin"
+: > "$EMPTY"
+./beam -q -P 9877 -t 8s "$EMPTY" > "$TMP_DIR/empty.log" 2>&1 &
+EMPTY_PID=$!
+sleep 0.5
+EMPTY_TOKEN=$(grep "Link:" "$TMP_DIR/empty.log" | grep -oE '[0-9a-f]{32}' | head -1)
+EMPTY_HDR=$(curl -s -i "http://127.0.0.1:9877/$EMPTY_TOKEN")
+if echo "$EMPTY_HDR" | grep -q "HTTP/1.1 200 OK" && \
+   echo "$EMPTY_HDR" | grep -q "Content-Length: 0" && \
+   echo "$EMPTY_HDR" | grep -q "Connection: close"; then
+    echo "[PASS] Empty file returns 200, length 0, Connection: close"
+else
+    echo "[FAIL] Empty file headers unexpected:\n$EMPTY_HDR"
+    kill $EMPTY_PID 2>/dev/null || true
+    exit 1
+fi
+EMPTY_416=$(curl -s -o /dev/null -w "%{http_code}" -H "Range: bytes=0-0" "http://127.0.0.1:9877/$EMPTY_TOKEN")
+if [ "$EMPTY_416" = "416" ]; then
+    echo "[PASS] Range on empty file returns 416"
+else
+    echo "[FAIL] Range on empty file returned $EMPTY_416"
+    kill $EMPTY_PID 2>/dev/null || true
+    exit 1
+fi
+kill $EMPTY_PID 2>/dev/null || true
+wait $EMPTY_PID 2>/dev/null || true
+
+# 15. Filename escaping in HTML player
+echo "Testing HTML filename escaping..."
+EVIL="$TMP_DIR/evil<script>\".mp4"
+cp "$TEST_MP4" "$EVIL"
+./beam -q -w -P 9878 -t 8s "$EVIL" > "$TMP_DIR/evil.log" 2>&1 &
+EVIL_PID=$!
+sleep 0.5
+EVIL_TOKEN=$(grep "Link:" "$TMP_DIR/evil.log" | grep -oE '[0-9a-f]{32}' | head -1)
+EVIL_PAGE=$(curl -s "http://127.0.0.1:9878/$EVIL_TOKEN")
+if echo "$EVIL_PAGE" | grep -q '&quot;' && echo "$EVIL_PAGE" | grep -q '&lt;script&gt;' && ! echo "$EVIL_PAGE" | grep -q '<script>'; then
+    echo "[PASS] HTML player escapes quotes and angle brackets in filename"
+else
+    echo "[FAIL] HTML player did not escape filename:\n$EVIL_PAGE"
+    kill $EVIL_PID 2>/dev/null || true
+    exit 1
+fi
+kill $EVIL_PID 2>/dev/null || true
+wait $EVIL_PID 2>/dev/null || true
+
+# 16. Header filename sanitization (stripping quotes and control characters from Content-Disposition)
+echo "Testing Content-Disposition filename sanitization..."
+DISP_HDR=$(curl -s -i "http://127.0.0.1:9878/$EVIL_TOKEN/raw" 2>/dev/null || true)
+# Start server with evil filename to test raw stream header
+./beam -q -P 9879 -t 8s "$EVIL" > "$TMP_DIR/evil_raw.log" 2>&1 &
+EVIL_RAW_PID=$!
+sleep 0.5
+EVIL_RAW_TOK=$(grep "Link:" "$TMP_DIR/evil_raw.log" | grep -oE '[0-9a-f]{32}' | head -1)
+DISP_HDR=$(curl -s -i "http://127.0.0.1:9879/$EVIL_RAW_TOK")
+if echo "$DISP_HDR" | grep -q 'Content-Disposition: inline; filename="evil<script>.mp4"'; then
+    echo "[PASS] Content-Disposition stripped dangerous quote from filename"
+else
+    echo "[FAIL] Content-Disposition header unexpected:\n$DISP_HDR"
+    kill $EVIL_RAW_PID 2>/dev/null || true
+    exit 1
+fi
+kill $EVIL_RAW_PID 2>/dev/null || true
+wait $EVIL_RAW_PID 2>/dev/null || true
+
+# 17. Concurrent overlapping Range requests (testing forked client workers)
+echo "Testing concurrent overlapping Range requests..."
+./beam -q -P 9880 -t 8s "$TEST_MP4" > "$TMP_DIR/concurrent.log" 2>&1 &
+CONC_PID=$!
+sleep 0.5
+CONC_TOK=$(grep "Link:" "$TMP_DIR/concurrent.log" | grep -oE '[0-9a-f]{32}' | head -1)
+
+# Fire 4 concurrent range requests simultaneously
+curl -s -H "Range: bytes=0-99" "http://127.0.0.1:9880/$CONC_TOK" > "$TMP_DIR/part1" &
+C1=$!
+curl -s -H "Range: bytes=100-199" "http://127.0.0.1:9880/$CONC_TOK" > "$TMP_DIR/part2" &
+C2=$!
+curl -s -H "Range: bytes=200-299" "http://127.0.0.1:9880/$CONC_TOK" > "$TMP_DIR/part3" &
+C3=$!
+curl -s -H "Range: bytes=300-399" "http://127.0.0.1:9880/$CONC_TOK" > "$TMP_DIR/part4" &
+C4=$!
+
+wait $C1 $C2 $C3 $C4
+if [ $(wc -c < "$TMP_DIR/part1") -eq 100 ] && \
+   [ $(wc -c < "$TMP_DIR/part2") -eq 100 ] && \
+   [ $(wc -c < "$TMP_DIR/part3") -eq 100 ] && \
+   [ $(wc -c < "$TMP_DIR/part4") -eq 100 ]; then
+    echo "[PASS] Handled 4 concurrent overlapping Range requests"
+else
+    echo "[FAIL] Concurrent requests returned incorrect byte counts"
+    kill $CONC_PID 2>/dev/null || true
+    exit 1
+fi
+kill $CONC_PID 2>/dev/null || true
+wait $CONC_PID 2>/dev/null || true
+
+# 18. Reopen last file & token test
+echo "Testing reopen last file & token..."
+REOPEN_SEED_LOG="$TMP_DIR/reopen_seed.log"
+./beam -q -P 9881 -t 2s "$TEST_MP4" > "$REOPEN_SEED_LOG" 2>&1 &
+SEED_PID=$!
+sleep 0.5
+SEED_TOKEN=$(grep "Link:" "$REOPEN_SEED_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
+kill $SEED_PID 2>/dev/null || true
+wait $SEED_PID 2>/dev/null || true
+
+REOPEN_LOG="$TMP_DIR/reopen.log"
+# Invoke beam with no file arguments using -r
+./beam -q -P 9882 -r -t 2s > "$REOPEN_LOG" 2>&1 &
+REOPEN_PID=$!
+sleep 0.5
+REOPEN_TOKEN=$(grep "Link:" "$REOPEN_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
+if [ -n "$REOPEN_TOKEN" ] && [ "$REOPEN_TOKEN" = "$SEED_TOKEN" ]; then
+    RESP=$(curl -s -i "http://127.0.0.1:9882/$REOPEN_TOKEN")
+    if echo "$RESP" | grep -q "video/mp4" && echo "$RESP" | grep -q "sample.mp4"; then
+        echo "[PASS] Reopened last file with identical 32-char token and valid video stream"
+    else
+        echo "[FAIL] Reopened file response unexpected:\n$RESP"
+        kill $REOPEN_PID 2>/dev/null || true
+        exit 1
+    fi
+else
+    echo "[FAIL] Reopened token mismatch or failed: seed=$SEED_TOKEN reopen=$REOPEN_TOKEN"
+    cat "$REOPEN_LOG"
+    kill $REOPEN_PID 2>/dev/null || true
+    exit 1
+fi
+kill $REOPEN_PID 2>/dev/null || true
+wait $REOPEN_PID 2>/dev/null || true
+
+# 19. Custom token flag (-k) test with 32-char token
+echo "Testing custom token flag (-k)..."
+CUSTOM_LOG="$TMP_DIR/custom_token.log"
+CUSTOM_TOK="0123456789abcdef0123456789abcdef"
+./beam -q -P 9883 -k "$CUSTOM_TOK" -t 2s "$TEST_TXT" > "$CUSTOM_LOG" 2>&1 &
+CUSTOM_PID=$!
+sleep 0.5
+if grep -q "$CUSTOM_TOK" "$CUSTOM_LOG"; then
+    RESP=$(curl -s -i "http://127.0.0.1:9883/$CUSTOM_TOK")
+    if echo "$RESP" | grep -q "200 OK"; then
+        echo "[PASS] Custom 32-char token (-k) correctly accepted and served"
+    else
+        echo "[FAIL] Custom token curl failed:\n$RESP"
+        kill $CUSTOM_PID 2>/dev/null || true
+        exit 1
+    fi
+else
+    echo "[FAIL] Custom token not found in output:"
+    cat "$CUSTOM_LOG"
+    kill $CUSTOM_PID 2>/dev/null || true
+    exit 1
+fi
+kill $CUSTOM_PID 2>/dev/null || true
+wait $CUSTOM_PID 2>/dev/null || true
+
+# 20. Ephemeral public tunnel flag (-p) test
 echo "Testing public tunnel flag (-p)..."
 TUNNEL_LOG="$TMP_DIR/tunnel.log"
 ./beam -q -p -t 2s "$TEST_TXT" > "$TUNNEL_LOG" 2>&1 &
@@ -287,62 +463,5 @@ if grep -q "https://.*\.lhr\." "$TUNNEL_LOG" && ! grep -q "admin\.localhost\.run
 else
     echo "[WARN] -p completed or skipped"
 fi
-
-# 15. Reopen last file & token test
-echo "Testing reopen last file & token..."
-REOPEN_SEED_LOG="$TMP_DIR/reopen_seed.log"
-./beam -q -P 9877 -t 2s "$TEST_MP4" > "$REOPEN_SEED_LOG" 2>&1 &
-SEED_PID=$!
-sleep 0.5
-SEED_TOKEN=$(grep "Link:" "$REOPEN_SEED_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
-kill $SEED_PID 2>/dev/null || true
-wait $SEED_PID 2>/dev/null || true
-
-REOPEN_LOG="$TMP_DIR/reopen.log"
-# Invoke beam with no file arguments using -r
-./beam -q -P 9878 -r -t 2s > "$REOPEN_LOG" 2>&1 &
-REOPEN_PID=$!
-sleep 0.5
-REOPEN_TOKEN=$(grep "Link:" "$REOPEN_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
-if [ -n "$REOPEN_TOKEN" ] && [ "$REOPEN_TOKEN" = "$SEED_TOKEN" ]; then
-    RESP=$(curl -s -i "http://127.0.0.1:9878/$REOPEN_TOKEN")
-    if echo "$RESP" | grep -q "video/mp4" && echo "$RESP" | grep -q "sample.mp4"; then
-        echo "[PASS] Reopened last file with identical token and valid video stream"
-    else
-        echo "[FAIL] Reopened file response unexpected:\n$RESP"
-        kill $REOPEN_PID 2>/dev/null || true
-        exit 1
-    fi
-else
-    echo "[FAIL] Reopened token mismatch or failed: seed=$SEED_TOKEN reopen=$REOPEN_TOKEN"
-    cat "$REOPEN_LOG"
-    kill $REOPEN_PID 2>/dev/null || true
-    exit 1
-fi
-kill $REOPEN_PID 2>/dev/null || true
-
-# 16. Custom token flag (-k) test
-echo "Testing custom token flag (-k)..."
-CUSTOM_LOG="$TMP_DIR/custom_token.log"
-CUSTOM_TOK="123456abcdef"
-./beam -q -P 9879 -k "$CUSTOM_TOK" -t 2s "$TEST_TXT" > "$CUSTOM_LOG" 2>&1 &
-CUSTOM_PID=$!
-sleep 0.5
-if grep -q "$CUSTOM_TOK" "$CUSTOM_LOG"; then
-    RESP=$(curl -s -i "http://127.0.0.1:9879/$CUSTOM_TOK")
-    if echo "$RESP" | grep -q "200 OK"; then
-        echo "[PASS] Custom token (-k) correctly accepted and served"
-    else
-        echo "[FAIL] Custom token curl failed:\n$RESP"
-        kill $CUSTOM_PID 2>/dev/null || true
-        exit 1
-    fi
-else
-    echo "[FAIL] Custom token not found in output:"
-    cat "$CUSTOM_LOG"
-    kill $CUSTOM_PID 2>/dev/null || true
-    exit 1
-fi
-kill $CUSTOM_PID 2>/dev/null || true
 
 echo "=== All tests passed successfully! ==="

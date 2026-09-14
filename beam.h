@@ -7,7 +7,7 @@
 #include <time.h>
 
 #define DEFAULT_TTL (5 * 3600) /* 5 hours */
-#define TOKEN_HEX_LEN 12
+#define TOKEN_HEX_LEN 32
 
 typedef struct {
     char filepath[1024];
@@ -40,7 +40,7 @@ bool beam_is_media(const char *mimetype);
 /* Utilities */
 void beam_format_size(int64_t bytes, char *buf, size_t maxlen);
 int  beam_parse_duration(const char *str);
-void beam_generate_token(char *token, size_t len);
+int  beam_generate_token(char *token, size_t len);
 int  beam_detect_local_ip(char *buf, size_t maxlen);
 
 #endif /* BEAM_H */
