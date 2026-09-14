@@ -24,8 +24,14 @@ When sharing video, browsers open their native media player.
 handles HTTP 206 Partial Content range requests so browsers can seek through
 MP4 and WebM files without downloading the entire file first.
 .P
-The URL path contains a random 12-character hex token (for example,
-.IR https://5369e9d69bbb03.lhr.life/4bdaa908ed74 ).
+The URL path contains a random 32-character hex token from /dev/urandom
+(for example,
+.IR https://5369e9d69bbb03.lhr.life/4bdaa908ed74c21a9f03b8e1d5a7c6e2 ).
+.P
+The
+.B \-p
+tunnel disables SSH compression and uses larger TCP buffers so native
+players can keep Range requests on one connection across the hop.
 .B beam
 renders an ANSI QR code in the terminal using Unicode half-blocks and exits
 when the lifetime timer expires (default: 5 hours).

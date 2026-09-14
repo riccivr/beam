@@ -28,7 +28,8 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 ## How it works
 
 - **Direct browser playback.** Beam serves files with `Content-Disposition: inline` and matching MIME types. Browsers open audio and video files in their native media controls.
-- **Clean hash URLs.** Links use a 12-character hex token (for example, `https://5369e9d69bbb03.lhr.life/4bdaa908ed74`). Beam also accepts query format `/?v=<hash>`.
+- **Clean hash URLs.** Links use a 32-character hex token from `/dev/urandom` (128 bits). Beam also accepts query format `/?v=<hash>`.
+- **Public-tunnel playback.** `-p` SSH forwarding disables compression (video is already compressed), raises socket buffers, and assembles full HTTP requests so Range seeks survive tunnel latency.
 - **Range seeking.** Single-range byte requests let browsers scrub through MP4 and WebM videos without downloading the whole file first.
 - **Keep-alive + sendfile.** HTTP/1.1 persistent connections and `sendfile()` cut the stalls native players hit when they open many Range requests.
 - **MP4 fast start.** If `ffmpeg` is available, beam remuxes MP4/MOV so the `moov` atom is at the front (`-movflags +faststart`). Use `-F` to skip.

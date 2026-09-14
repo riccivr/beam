@@ -143,6 +143,20 @@ static void set_tcp_nodelay(SOCKET sock) {
 #endif
 }
 
+static void set_media_sockopts(SOCKET sock) {
+    int buf = 512 * 1024;
+
+    set_tcp_nodelay(sock);
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const void *)&buf, sizeof(buf));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const void *)&buf, sizeof(buf));
+#ifdef TCP_QUICKACK
+    {
+        int on = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_QUICKACK, (const void *)&on, sizeof(on));
+    }
+#endif
+}
+
 static bool send_file_range(SOCKET sock, FILE *fp, int64_t offset, int64_t length) {
     if (length <= 0)
         return true;
@@ -566,6 +580,11 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
                "-o", "StrictHostKeyChecking=no",
                "-o", "UserKnownHostsFile=/dev/null",
                "-o", "ExitOnForwardFailure=yes",
+               "-o", "Compression=no",
+               "-o", "IPQoS=throughput",
+               "-o", "TCPKeepAlive=yes",
+               "-o", "ServerAliveInterval=15",
+               "-o", "ServerAliveCountMax=4",
                "-R", port_spec,
                "nokey@localhost.run",
                (char *)NULL);
@@ -881,6 +900,10 @@ static int process_request(SOCKET client_sock, const BeamConfig *cfg,
         send_http_response(client_sock, 500, "Internal Server Error", NULL, "Failed to read file\n", 20, *keep_alive);
         return 0;
     }
+#if defined(POSIX_FADV_SEQUENTIAL) && !defined(_WIN32)
+    posix_fadvise(fileno(fp), 0, 0, POSIX_FADV_SEQUENTIAL);
+    posix_fadvise(fileno(fp), 0, 0, POSIX_FADV_WILLNEED);
+#endif
 
     int64_t range_start = 0;
     int64_t range_end = cfg->filesize > 0 ? cfg->filesize - 1 : 0;
@@ -1031,18 +1054,48 @@ static int process_request(SOCKET client_sock, const BeamConfig *cfg,
 }
 
 static int recv_request(SOCKET sock, char *buf, size_t buflen, int timeout_ms) {
-    struct pollfd pfd;
-    pfd.fd = sock;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-    int pr = poll(&pfd, 1, timeout_ms);
-    if (pr <= 0)
+    size_t used = 0;
+    time_t deadline = time(NULL) + (timeout_ms + 999) / 1000;
+
+    if (buflen < 2)
         return 0;
-    int n = recv(sock, buf, (int)buflen - 1, 0);
-    if (n <= 0)
-        return 0;
-    buf[n] = '\0';
-    return n;
+
+    while (used + 1 < buflen) {
+        int wait_ms = timeout_ms;
+        time_t now = time(NULL);
+        if (used > 0) {
+            if (now >= deadline)
+                break;
+            wait_ms = (int)((deadline - now) * 1000);
+            if (wait_ms < 50)
+                wait_ms = 50;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, wait_ms);
+        if (pr < 0) {
+#ifndef _WIN32
+            if (errno == EINTR)
+                continue;
+#endif
+            return used ? (int)used : 0;
+        }
+        if (pr == 0)
+            return used ? (int)used : 0;
+
+        int n = recv(sock, buf + used, (int)(buflen - 1 - used), 0);
+        if (n <= 0)
+            return used ? (int)used : 0;
+        used += (size_t)n;
+        buf[used] = '\0';
+        if (strstr(buf, "\r\n\r\n") != NULL)
+            return (int)used;
+    }
+    buf[used] = '\0';
+    return used ? (int)used : 0;
 }
 
 /* Returns 1 if a complete non-range GET finished (for -1). */
@@ -1050,7 +1103,7 @@ static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
     int complete = 0;
     bool keep_alive = true;
 
-    set_tcp_nodelay(client_sock);
+    set_media_sockopts(client_sock);
 
     char req_buf[8192];
     int n = recv_request(client_sock, req_buf, sizeof(req_buf), 30000);
@@ -1491,7 +1544,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (listen(server_sock, 16) < 0) {
+    if (listen(server_sock, 128) < 0) {
         fprintf(stderr, "beam: listen failed: %s\n", strerror(errno));
         close_socket(server_sock);
         return 1;
