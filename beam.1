@@ -1,0 +1,101 @@
+.TH BEAM 1 beam\-VERSION
+.SH NAME
+beam \- ephemeral local-first file and video sharing utility
+.SH SYNOPSIS
+.B beam
+.RB [ \-1cpqrv ]
+.RB [ \-t
+.IR ttl ]
+.RB [ \-b
+.IR ip ]
+.RB [ \-P
+.IR port ]
+.RI file
+.SH DESCRIPTION
+.B beam
+is a suckless, dependency-free command-line tool that generates a short-lived,
+secure link to share videos and files directly from your machine.
+.P
+When sharing videos,
+.B beam
+automatically detects media types and serves an embedded, responsive HTML5
+video player for immediate playback on mobile devices (iOS Safari, Android
+Chrome) or desktop browsers. Full HTTP 206 Partial Content (Range requests)
+is supported for seamless video seeking and scrubbing without requiring
+multi-gigabyte downloads.
+.P
+.B beam
+generates a 128-bit unguessable random token in the URL path, prints an
+ANSI QR code in the terminal for instant camera scanning, and terminates
+automatically after a configurable lifetime (default 5 hours).
+.SH OPTIONS
+.TP
+.BI \-t " ttl"
+Set link lifetime. Suffixes
+.BR s " (seconds),"
+.BR m " (minutes),"
+.BR h " (hours),"
+or
+.BR d " (days)"
+are supported. Default is
+.BR 5h .
+.TP
+.B \-p
+Spawn an ephemeral public HTTPS reverse tunnel via SSH (localhost.run) so
+the link can be accessed over the internet outside your local network.
+.TP
+.B \-c
+Copy the generated share URL to the system clipboard (integrates with
+.BR clipbridge ,
+.BR wl-copy ,
+.BR xclip ,
+.BR pbcopy ,
+or
+.BR clip.exe ).
+.TP
+.B \-q
+Quiet mode. Suppress the terminal QR code and display only textual details.
+.TP
+.B \-1
+One-shot mode. Exit immediately after the first complete file download or view.
+.TP
+.B \-r
+Raw stream only. Disable the HTML5 web player and always serve the file directly.
+.TP
+.BI \-b " ip"
+Specify the IP address to bind to. Default is
+.BR 0.0.0.0 .
+.TP
+.BI \-P " port"
+Specify the port to listen on. Default is
+.BR 8080 ,
+or the next available port.
+.TP
+.B \-v
+Print version information to standard output and exit.
+.SH EXAMPLES
+Share a dubbed video with default 5-hour lifetime:
+.IP
+.EX
+beam dubbed_video.mp4
+.EE
+.P
+Share a video over the internet with public HTTPS tunnel and copy link:
+.IP
+.EX
+beam -p -c dubbed_video.mp4
+.EE
+.P
+Share a zip archive valid for 30 minutes in one-shot mode:
+.IP
+.EX
+beam -t 30m -1 archive.zip
+.EE
+.P
+Share without terminal QR code on port 9000:
+.IP
+.EX
+beam -q -P 9000 document.pdf
+.EE
+.SH AUTHORS
+See the LICENSE file for authors and copyright details.
