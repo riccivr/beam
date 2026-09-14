@@ -46,10 +46,16 @@
   #include <poll.h>
   #include <sys/wait.h>
   #include <termios.h>
+  #include <netinet/tcp.h>
+#ifdef __linux__
+  #include <sys/sendfile.h>
+#endif
   #define close_socket(s) close(s)
   typedef int SOCKET;
   #define INVALID_SOCKET (-1)
 #endif
+
+#define KEEP_ALIVE_MS 15000
 
 #ifndef VERSION
 #define VERSION "1.0.0"
@@ -59,6 +65,7 @@ char *argv0;
 static volatile sig_atomic_t running = 1;
 static pid_t tunnel_pid = -1;
 static char global_temp_file[1024] = "";
+static char global_faststart_file[1024] = "";
 
 #ifndef _WIN32
 static struct termios orig_termios;
@@ -96,6 +103,10 @@ static void cleanup_temp_file(void) {
         unlink(global_temp_file);
         global_temp_file[0] = '\0';
     }
+    if (global_faststart_file[0]) {
+        unlink(global_faststart_file);
+        global_faststart_file[0] = '\0';
+    }
 }
 
 static void sig_handler(int sig) {
@@ -121,6 +132,59 @@ static bool send_all(SOCKET sock, const void *data, size_t len) {
         off += (size_t)n;
     }
     return true;
+}
+
+static void set_tcp_nodelay(SOCKET sock) {
+#ifdef TCP_NODELAY
+    int on = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const void *)&on, sizeof(on));
+#else
+    (void)sock;
+#endif
+}
+
+static bool send_file_range(SOCKET sock, FILE *fp, int64_t offset, int64_t length) {
+    if (length <= 0)
+        return true;
+
+#if defined(__linux__) && !defined(_WIN32)
+    {
+        int fd = fileno(fp);
+        off_t off = (off_t)offset;
+        while (length > 0 && running) {
+            ssize_t n = sendfile(sock, fd, &off, (size_t)length);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                break; /* fall back to read/send below from current offset */
+            }
+            if (n == 0)
+                break;
+            length -= (int64_t)n;
+        }
+        if (length == 0)
+            return true;
+        offset = (int64_t)off;
+    }
+#endif
+
+#if defined(_WIN32)
+    _fseeki64(fp, offset, SEEK_SET);
+#else
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0)
+        return false;
+#endif
+    while (length > 0 && running) {
+        char chunk[65536];
+        size_t to_read = (length > (int64_t)sizeof(chunk)) ? sizeof(chunk) : (size_t)length;
+        size_t bytes_read = fread(chunk, 1, to_read, fp);
+        if (bytes_read == 0)
+            return false;
+        if (!send_all(sock, chunk, bytes_read))
+            return false;
+        length -= (int64_t)bytes_read;
+    }
+    return length == 0;
 }
 
 static const char *ci_strstr(const char *haystack, const char *needle) {
@@ -624,14 +688,19 @@ static void header_filename(const char *in, char *out, size_t outlen) {
 }
 
 static void send_http_response(SOCKET sock, int status, const char *status_text,
-                               const char *extra_headers, const char *body, size_t body_len) {
+                               const char *extra_headers, const char *body, size_t body_len,
+                               bool keep_alive) {
     char header[1024];
     int hlen = snprintf(header, sizeof(header),
                         "HTTP/1.1 %d %s\r\n"
                         "Content-Length: %zu\r\n"
                         "%s"
-                        "Connection: close\r\n\r\n",
-                        status, status_text, body_len, extra_headers ? extra_headers : "");
+                        "Connection: %s\r\n"
+                        "%s\r\n",
+                        status, status_text, body_len,
+                        extra_headers ? extra_headers : "",
+                        keep_alive ? "keep-alive" : "close",
+                        keep_alive ? "Keep-Alive: timeout=15\r\n" : "");
     if (hlen < 0 || (size_t)hlen >= sizeof(header))
         return;
     if (!send_all(sock, header, (size_t)hlen))
@@ -737,44 +806,59 @@ static bool extract_token(const char *path, const char *expected_token, const ch
     return true;
 }
 
-/* Returns 1 if a complete non-range GET finished (for -1). */
-static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
-    int complete = 0;
-    char req_buf[4096];
-    int n = recv(client_sock, req_buf, sizeof(req_buf) - 1, 0);
-    if (n <= 0) {
-        close_socket(client_sock);
-        return 0;
-    }
-    req_buf[n] = '\0';
-
-    /* Parse request line: METHOD PATH PROTOCOL */
+/* Serve one HTTP request. Returns 1 if a complete non-range GET finished.
+ * *keep_alive is updated from proto / Connection header. Does not close sock.
+ */
+static int process_request(SOCKET client_sock, const BeamConfig *cfg,
+                           const char *req_buf, bool *keep_alive) {
     char method[16] = "";
     char path[1024] = "";
     char proto[16] = "";
     if (sscanf(req_buf, "%15s %1023s %15s", method, path, proto) < 2) {
-        send_http_response(client_sock, 400, "Bad Request", NULL, "Bad Request\n", 12);
-        close_socket(client_sock);
+        send_http_response(client_sock, 400, "Bad Request", NULL, "Bad Request\n", 12, false);
+        *keep_alive = false;
         return 0;
+    }
+
+    if (strncasecmp(proto, "HTTP/1.0", 8) == 0)
+        *keep_alive = false;
+    else
+        *keep_alive = true;
+
+    {
+        const char *line = req_buf;
+        while (line && *line) {
+            const char *eol = strstr(line, "\r\n");
+            size_t linelen = eol ? (size_t)(eol - line) : strlen(line);
+            if (linelen == 0)
+                break;
+            if (linelen >= 11 && strncasecmp(line, "Connection:", 11) == 0) {
+                const char *v = line + 11;
+                while (*v == ' ' || *v == '\t')
+                    v++;
+                if (strncasecmp(v, "close", 5) == 0)
+                    *keep_alive = false;
+                else if (strncasecmp(v, "keep-alive", 10) == 0)
+                    *keep_alive = true;
+            }
+            line = eol ? eol + 2 : NULL;
+        }
     }
 
     bool is_get = (strcmp(method, "GET") == 0);
     bool is_head = (strcmp(method, "HEAD") == 0);
 
     if (!is_get && !is_head) {
-        send_http_response(client_sock, 405, "Method Not Allowed", "Allow: GET, HEAD\r\n", "Method Not Allowed\n", 19);
-        close_socket(client_sock);
+        send_http_response(client_sock, 405, "Method Not Allowed", "Allow: GET, HEAD\r\n", "Method Not Allowed\n", 19, *keep_alive);
         return 0;
     }
 
     const char *subpath = NULL;
     if (!extract_token(path, cfg->token, &subpath)) {
-        send_http_response(client_sock, 404, "Not Found", NULL, "404 Not Found\n", 14);
-        close_socket(client_sock);
+        send_http_response(client_sock, 404, "Not Found", NULL, "404 Not Found\n", 14, *keep_alive);
         return 0;
     }
 
-    /* HTML web player page if explicitly enabled or requested */
     bool want_player = false;
     if (cfg->web_player && beam_is_media(cfg->mimetype)) {
         if (!subpath || (strcmp(subpath, "/raw") != 0 && strcmp(subpath, "/raw/") != 0)) {
@@ -788,20 +872,16 @@ static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
         char html[8192];
         render_html_player(html, sizeof(html), cfg);
         size_t hlen = strlen(html);
-        send_http_response(client_sock, 200, "OK", "Content-Type: text/html; charset=utf-8\r\n", is_get ? html : NULL, hlen);
-        close_socket(client_sock);
+        send_http_response(client_sock, 200, "OK", "Content-Type: text/html; charset=utf-8\r\n", is_get ? html : NULL, hlen, *keep_alive);
         return 0;
     }
 
-    /* Stream raw file directly with inline disposition so browser plays video */
     FILE *fp = fopen(cfg->filepath, "rb");
     if (!fp) {
-        send_http_response(client_sock, 500, "Internal Server Error", NULL, "Failed to read file\n", 20);
-        close_socket(client_sock);
+        send_http_response(client_sock, 500, "Internal Server Error", NULL, "Failed to read file\n", 20, *keep_alive);
         return 0;
     }
 
-    /* Parse Range header line by line */
     int64_t range_start = 0;
     int64_t range_end = cfg->filesize > 0 ? cfg->filesize - 1 : 0;
     bool is_range = false;
@@ -830,7 +910,6 @@ static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
 
     if (range_hdr) {
         if (*range_hdr == '-') {
-            /* Suffix range: bytes=-500 */
             long long suffix = atoll(range_hdr + 1);
             if (suffix <= 0) {
                 range_invalid = true;
@@ -868,13 +947,11 @@ static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
     if (cfg->filesize <= 0 && (is_range || range_hdr))
         range_invalid = true;
 
-    /* Validate range */
     if (range_invalid) {
         char err_hdr[256];
         snprintf(err_hdr, sizeof(err_hdr), "Content-Range: bytes */%" PRId64 "\r\n", cfg->filesize);
-        send_http_response(client_sock, 416, "Range Not Satisfiable", err_hdr, "Range Not Satisfiable\n", 22);
+        send_http_response(client_sock, 416, "Range Not Satisfiable", err_hdr, "Range Not Satisfiable\n", 22, *keep_alive);
         fclose(fp);
-        close_socket(client_sock);
         return 0;
     }
 
@@ -885,9 +962,28 @@ static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
     char headers[1024];
     char disp_name[256];
     int hlen = 0;
-
     header_filename(cfg->filename, disp_name, sizeof(disp_name));
 
+    hlen = snprintf(headers, sizeof(headers),
+                    "HTTP/1.1 %d %s\r\n"
+                    "Content-Type: %s\r\n"
+                    "Content-Length: %" PRId64 "\r\n"
+                    "%s"
+                    "Content-Disposition: inline; filename=\"%s\"\r\n"
+                    "Accept-Ranges: bytes\r\n"
+                    "Cache-Control: public, max-age=60\r\n"
+                    "Connection: %s\r\n"
+                    "%s"
+                    "\r\n",
+                    status_code, status_str,
+                    cfg->mimetype,
+                    content_length,
+                    is_range ? "" : "",
+                    disp_name,
+                    *keep_alive ? "keep-alive" : "close",
+                    *keep_alive ? "Keep-Alive: timeout=15\r\n" : "");
+
+    /* rebuild with Content-Range when needed — snprintf above omitted range on purpose */
     if (is_range) {
         hlen = snprintf(headers, sizeof(headers),
                         "HTTP/1.1 %d %s\r\n"
@@ -896,71 +992,181 @@ static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
                         "Content-Range: bytes %" PRId64 "-%" PRId64 "/%" PRId64 "\r\n"
                         "Content-Disposition: inline; filename=\"%s\"\r\n"
                         "Accept-Ranges: bytes\r\n"
-                        "Connection: close\r\n\r\n",
+                        "Cache-Control: public, max-age=60\r\n"
+                        "Connection: %s\r\n"
+                        "%s"
+                        "\r\n",
                         status_code, status_str,
                         cfg->mimetype,
                         content_length,
                         range_start, range_end, cfg->filesize,
-                        disp_name);
-    } else {
-        hlen = snprintf(headers, sizeof(headers),
-                        "HTTP/1.1 %d %s\r\n"
-                        "Content-Type: %s\r\n"
-                        "Content-Length: %" PRId64 "\r\n"
-                        "Accept-Ranges: bytes\r\n"
-                        "Content-Disposition: inline; filename=\"%s\"\r\n"
-                        "Connection: close\r\n\r\n",
-                        status_code, status_str,
-                        cfg->mimetype,
-                        content_length,
-                        disp_name);
+                        disp_name,
+                        *keep_alive ? "keep-alive" : "close",
+                        *keep_alive ? "Keep-Alive: timeout=15\r\n" : "");
     }
 
     if (hlen < 0 || (size_t)hlen >= sizeof(headers)) {
         fclose(fp);
-        close_socket(client_sock);
+        *keep_alive = false;
         return 0;
     }
     if (!send_all(client_sock, headers, (size_t)hlen)) {
         fclose(fp);
-        close_socket(client_sock);
+        *keep_alive = false;
         return 0;
     }
 
-    /* Stream body if GET */
+    int complete = 0;
     if (is_get && content_length > 0) {
-#if defined(_WIN32)
-        _fseeki64(fp, range_start, SEEK_SET);
-#else
-        fseeko(fp, (off_t)range_start, SEEK_SET);
-#endif
-        int64_t remaining = content_length;
-        char chunk[65536];
-
-        while (remaining > 0 && running) {
-            size_t to_read = (remaining > (int64_t)sizeof(chunk)) ? sizeof(chunk) : (size_t)remaining;
-            size_t bytes_read = fread(chunk, 1, to_read, fp);
-            if (bytes_read == 0)
-                break;
-
-            if (!send_all(client_sock, chunk, bytes_read))
-                break;
-            remaining -= (int64_t)bytes_read;
-        }
-
-        if (remaining == 0 && !is_range)
+        if (!send_file_range(client_sock, fp, is_range ? range_start : 0, content_length))
+            *keep_alive = false;
+        else if (!is_range)
             complete = 1;
     } else if (is_get && content_length == 0 && !is_range) {
         complete = 1;
     }
 
     fclose(fp);
+    return complete;
+}
+
+static int recv_request(SOCKET sock, char *buf, size_t buflen, int timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd = sock;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int pr = poll(&pfd, 1, timeout_ms);
+    if (pr <= 0)
+        return 0;
+    int n = recv(sock, buf, (int)buflen - 1, 0);
+    if (n <= 0)
+        return 0;
+    buf[n] = '\0';
+    return n;
+}
+
+/* Returns 1 if a complete non-range GET finished (for -1). */
+static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
+    int complete = 0;
+    bool keep_alive = true;
+
+    set_tcp_nodelay(client_sock);
+
+    char req_buf[8192];
+    int n = recv_request(client_sock, req_buf, sizeof(req_buf), 30000);
+    if (n <= 0) {
+        close_socket(client_sock);
+        return 0;
+    }
+
+    for (;;) {
+        int rc = process_request(client_sock, cfg, req_buf, &keep_alive);
+        if (rc == 1)
+            complete = 1;
+        if (!keep_alive || !running)
+            break;
+        n = recv_request(client_sock, req_buf, sizeof(req_buf), KEEP_ALIVE_MS);
+        if (n <= 0)
+            break;
+    }
+
     close_socket(client_sock);
     return complete;
 }
 
+#ifndef _WIN32
+static bool mp4_moov_is_early(const char *path) {
+    FILE *f = fopen(path, "rb");
+    unsigned char buf[65536];
+    size_t n, i;
+
+    if (!f)
+        return true;
+    n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    for (i = 0; i + 4 <= n; i++) {
+        if (buf[i] == 'm' && buf[i + 1] == 'o' && buf[i + 2] == 'o' && buf[i + 3] == 'v')
+            return true;
+    }
+    return n < sizeof(buf);
+}
+
+static bool remux_faststart(BeamConfig *cfg) {
+    char outpath[] = "/tmp/beam_faststart_XXXXXX";
+    int fd, st;
+    pid_t pid;
+    struct stat outst;
+
+    fd = mkstemp(outpath);
+    if (fd < 0)
+        return false;
+    close(fd);
+    unlink(outpath);
+
+    pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("ffmpeg", "ffmpeg", "-nostdin", "-y", "-i", cfg->filepath,
+               "-c", "copy", "-movflags", "+faststart", outpath, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        unlink(outpath);
+        return false;
+    }
+    if (stat(outpath, &outst) != 0 || outst.st_size <= 0) {
+        unlink(outpath);
+        return false;
+    }
+
+    if (global_faststart_file[0])
+        unlink(global_faststart_file);
+    snprintf(global_faststart_file, sizeof(global_faststart_file), "%s", outpath);
+    snprintf(cfg->filepath, sizeof(cfg->filepath), "%s", outpath);
+    cfg->filesize = (int64_t)outst.st_size;
+    return true;
+}
+#endif
+
+static bool maybe_faststart(BeamConfig *cfg) {
+#ifndef _WIN32
+    bool mp4 = (cfg->mimetype &&
+                (strcmp(cfg->mimetype, "video/mp4") == 0 ||
+                 strcmp(cfg->mimetype, "video/quicktime") == 0));
+    bool should;
+
+    if (!mp4 || cfg->no_faststart)
+        return false;
+    if (!cfg->faststart && cfg->filesize < 4096)
+        return false;
+    should = cfg->faststart || !mp4_moov_is_early(cfg->filepath);
+    if (!should)
+        return false;
+    if (access("/usr/bin/ffmpeg", X_OK) != 0 && access("/usr/local/bin/ffmpeg", X_OK) != 0) {
+        /* still try PATH via execlp */
+    }
+    fprintf(stderr, "beam: remuxing MP4 for fast start...\n");
+    if (remux_faststart(cfg)) {
+        fprintf(stderr, "beam: serving fast-start MP4 (%" PRId64 " bytes)\n", cfg->filesize);
+        return true;
+    }
+    fprintf(stderr, "beam: warning: faststart remux failed (install ffmpeg); serving original file\n");
+#else
+    (void)cfg;
+#endif
+    return false;
+}
+
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-p] [-r] [-k token] [-H host] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-p] [-r] [-k token] [-H host] [-c] [-q] [-1] [-w] [-f] [-F] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
     fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (for remote sharing)\n");
     fprintf(stderr, "  -r        Reopen/resume last beamed file and link\n");
@@ -970,6 +1176,8 @@ static void usage(void) {
     fprintf(stderr, "  -q        Quiet mode: suppress terminal QR code\n");
     fprintf(stderr, "  -1        One-shot: exit after first complete download/view\n");
     fprintf(stderr, "  -w        HTML web player page (default: native browser stream)\n");
+    fprintf(stderr, "  -f        Force MP4 faststart remux (ffmpeg -movflags +faststart)\n");
+    fprintf(stderr, "  -F        Skip MP4 faststart remux\n");
     fprintf(stderr, "  -b ip     Bind IP address (default: 0.0.0.0)\n");
     fprintf(stderr, "  -P port   Listening port (default: 8080 or next available)\n");
     fprintf(stderr, "  -v        Show version\n");
@@ -1098,6 +1306,12 @@ int main(int argc, char *argv[]) {
     case 'w':
         cfg.web_player = true;
         break;
+    case 'f':
+        cfg.faststart = true;
+        break;
+    case 'F':
+        cfg.no_faststart = true;
+        break;
     case 'b':
         snprintf(cfg.bind_ip, sizeof(cfg.bind_ip), "%s", EARGF(usage()));
         break;
@@ -1222,6 +1436,7 @@ int main(int argc, char *argv[]) {
     }
 
     cfg.mimetype = beam_mime_type(cfg.filename);
+    maybe_faststart(&cfg);
 
     if (!cfg.token[0]) {
         if (beam_generate_token(cfg.token, sizeof(cfg.token)) != 0) {

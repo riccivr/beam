@@ -28,6 +28,8 @@ typedef struct {
     bool no_qr;
     bool web_player;
     bool resume_last;
+    bool faststart;
+    bool no_faststart;
 
     time_t start_time;
     char public_url[1024];
