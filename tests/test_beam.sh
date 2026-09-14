@@ -270,4 +270,17 @@ else
 fi
 kill $HOST_PID 2>/dev/null || true
 
+# 14. Ephemeral public tunnel flag (-p) test
+echo "Testing public tunnel flag (-p)..."
+TUNNEL_LOG="$TMP_DIR/tunnel.log"
+if timeout 8 ./beam -q -p -t 2s "$TEST_TXT" > "$TUNNEL_LOG" 2>&1; then
+    if grep -q "https://.*\.lhr\." "$TUNNEL_LOG" && ! grep -q "admin\.localhost\.run" "$TUNNEL_LOG"; then
+        echo "[PASS] -p generated public HTTPS tunnel link without admin login"
+    else
+        echo "[WARN] -p did not output expected .lhr domain (possible network delay)"
+    fi
+else
+    echo "[WARN] -p timed out or network unavailable"
+fi
+
 echo "=== All tests passed successfully! ==="

@@ -3,7 +3,7 @@
 beam \- ephemeral file and video sharing utility
 .SH SYNOPSIS
 .B beam
-.RB [ \-1cqvw ]
+.RB [ \-1cpqvw ]
 .RB [ \-t
 .IR ttl ]
 .RB [ \-H
@@ -45,6 +45,9 @@ or
 .BR d " (days)"
 are supported. Default is
 .BR 5h .
+.TP
+.B \-p
+Open an ephemeral public HTTPS reverse tunnel via SSH.
 .TP
 .BI \-H " host"
 Specify the host, IP address, or domain name to use in the share link (for example,
@@ -88,10 +91,10 @@ Share a video locally with default 5-hour lifetime:
 beam dubbed_video.mp4
 .EE
 .P
-Pipe from autodub to share a newly dubbed video and copy link:
+Pipe from autodub to share a newly dubbed video publicly:
 .IP
 .EX
-autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
 .EE
 .P
 Share a file using a Tailscale hostname:

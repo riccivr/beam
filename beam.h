@@ -23,11 +23,13 @@ typedef struct {
     int max_downloads;
     int download_count;
 
+    bool public_tunnel;
     bool copy_clipboard;
     bool no_qr;
     bool web_player;
 
     time_t start_time;
+    char public_url[1024];
 } BeamConfig;
 
 /* MIME detection */

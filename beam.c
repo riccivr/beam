@@ -54,6 +54,7 @@
 
 char *argv0;
 static volatile sig_atomic_t running = 1;
+static pid_t tunnel_pid = -1;
 static char global_temp_file[1024] = "";
 
 static void cleanup_temp_file(void) {
@@ -275,6 +276,81 @@ static bool copy_to_clipboard(const char *text) {
     }
     return false;
 }
+
+#ifndef _WIN32
+static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen) {
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout & stderr to pipe */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        char port_spec[64];
+        snprintf(port_spec, sizeof(port_spec), "80:localhost:%d", local_port);
+
+        execlp("ssh", "ssh",
+               "-T",
+               "-o", "StrictHostKeyChecking=no",
+               "-o", "UserKnownHostsFile=/dev/null",
+               "-o", "ExitOnForwardFailure=yes",
+               "-R", port_spec,
+               "nokey@localhost.run",
+               (char *)NULL);
+        _exit(1);
+    }
+
+    /* Parent */
+    close(pipefd[1]);
+    tunnel_pid = pid;
+
+    /* Read child output until we find the actual tunnel URL, ignoring admin/login links */
+    char line[2048];
+    size_t line_len = 0;
+    time_t t_start = time(NULL);
+
+    while (time(NULL) - t_start < 12) {
+        char ch;
+        ssize_t n = read(pipefd[0], &ch, 1);
+        if (n <= 0) break;
+
+        if (ch == '\n' || ch == '\r') {
+            line[line_len] = '\0';
+
+            /* Skip administrative domains that require account registration / email login */
+            if (!strstr(line, "admin.localhost.run") && !strstr(line, "localhost.run/docs")) {
+                char *tun = strstr(line, "tunneled with tls termination");
+                char *found = tun ? strstr(tun, "https://") : strstr(line, "https://");
+
+                if (found && (strstr(found, ".lhr.life") || strstr(found, ".lhr.pro") || strstr(found, ".localhost.run"))) {
+                    char *end = found;
+                    while (*end && !isspace((unsigned char)*end) && *end != ',') end++;
+                    *end = '\0';
+                    snprintf(public_url_out, maxlen, "%s", found);
+                    close(pipefd[0]);
+                    return true;
+                }
+            }
+            line_len = 0;
+        } else if (line_len + 1 < sizeof(line)) {
+            line[line_len++] = ch;
+        }
+    }
+
+    close(pipefd[0]);
+    return false;
+}
+#endif
 
 static void send_http_response(SOCKET sock, int status, const char *status_text,
                                const char *extra_headers, const char *body, size_t body_len) {
@@ -570,8 +646,9 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-H host] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-p] [-H host] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
+    fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (for remote sharing)\n");
     fprintf(stderr, "  -H host   Host or IP for share link (e.g. 192.168.1.50, mynode.ts.net)\n");
     fprintf(stderr, "  -c        Copy share link to system clipboard\n");
     fprintf(stderr, "  -q        Quiet mode: suppress terminal QR code\n");
@@ -583,7 +660,7 @@ static void usage(void) {
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "  If no file is specified, beam reads from standard input.\n");
     fprintf(stderr, "  Piping from autodub echoes progress and shares the dubbed video:\n");
-    fprintf(stderr, "    autodub.sh \"https://www.youtube.com/watch?v=...\" | beam -c\n");
+    fprintf(stderr, "    autodub \"https://www.youtube.com/watch?v=...\" | beam -p -c\n");
     exit(1);
 }
 
@@ -679,6 +756,9 @@ int main(int argc, char *argv[]) {
     ARGBEGIN {
     case 't':
         cfg.ttl_seconds = beam_parse_duration(EARGF(usage()));
+        break;
+    case 'p':
+        cfg.public_tunnel = true;
         break;
     case 'H':
         snprintf(cfg.host, sizeof(cfg.host), "%s", EARGF(usage()));
@@ -857,28 +937,44 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Build clean sharing URL: http://<host>:<port>/<token> */
+    /* Build sharing URL */
     char share_url[2048];
-    char host_str[256];
-    if (cfg.host[0]) {
-        snprintf(host_str, sizeof(host_str), "%s", cfg.host);
-    } else {
-        beam_detect_local_ip(host_str, sizeof(host_str));
-    }
+    bool tunnel_ok = false;
 
-    if (strstr(host_str, "://")) {
-        /* Full scheme specified, e.g. https://tunnel.example.com */
-        if (strchr(host_str + 8, ':')) {
-            snprintf(share_url, sizeof(share_url), "%s/%s", host_str, cfg.token);
+#ifndef _WIN32
+    if (cfg.public_tunnel) {
+        fprintf(stderr, "beam: establishing public tunnel...\n");
+        if (start_ssh_tunnel(cfg.port, cfg.public_url, sizeof(cfg.public_url))) {
+            snprintf(share_url, sizeof(share_url), "%s/%s", cfg.public_url, cfg.token);
+            tunnel_ok = true;
         } else {
-            snprintf(share_url, sizeof(share_url), "%s:%d/%s", host_str, cfg.port, cfg.token);
+            fprintf(stderr, "beam: warning: public tunnel failed, falling back to local network\n");
         }
-    } else {
-        if (strchr(host_str, ':')) {
-            /* Port already included in host argument */
-            snprintf(share_url, sizeof(share_url), "http://%s/%s", host_str, cfg.token);
+    }
+#endif
+
+    if (!tunnel_ok) {
+        char host_str[256];
+        if (cfg.host[0]) {
+            snprintf(host_str, sizeof(host_str), "%s", cfg.host);
         } else {
-            snprintf(share_url, sizeof(share_url), "http://%s:%d/%s", host_str, cfg.port, cfg.token);
+            beam_detect_local_ip(host_str, sizeof(host_str));
+        }
+
+        if (strstr(host_str, "://")) {
+            /* Full scheme specified, e.g. https://tunnel.example.com */
+            if (strchr(host_str + 8, ':')) {
+                snprintf(share_url, sizeof(share_url), "%s/%s", host_str, cfg.token);
+            } else {
+                snprintf(share_url, sizeof(share_url), "%s:%d/%s", host_str, cfg.port, cfg.token);
+            }
+        } else {
+            if (strchr(host_str, ':')) {
+                /* Port already included in host argument */
+                snprintf(share_url, sizeof(share_url), "http://%s/%s", host_str, cfg.token);
+            } else {
+                snprintf(share_url, sizeof(share_url), "http://%s:%d/%s", host_str, cfg.port, cfg.token);
+            }
         }
     }
 
@@ -966,7 +1062,12 @@ int main(int argc, char *argv[]) {
     /* Cleanup */
     close_socket(server_sock);
 
-#ifdef _WIN32
+#ifndef _WIN32
+    if (tunnel_pid > 0) {
+        kill(tunnel_pid, SIGTERM);
+        waitpid(tunnel_pid, NULL, WNOHANG);
+    }
+#else
     WSACleanup();
 #endif
 

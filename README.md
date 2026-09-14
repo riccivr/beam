@@ -30,6 +30,7 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 - **Range seeking.** Single-range byte requests let browsers scrub through MP4 and WebM videos without downloading the whole file first.
 - **Terminal QR code.** Renders a QR code with Unicode half-blocks so anyone on the same network can scan it from a phone.
 - **Auto expiration.** Sets a default five-hour lifetime, or custom durations using `s`, `m`, `h`, or `d`.
+- **Public tunnel.** Passing `-p` opens an ephemeral HTTPS reverse tunnel via SSH, returning a public link without requiring accounts or logins.
 - **Host override.** Passing `-H host` sets the host, IP, or domain in the link. Useful for Tailscale nodes or custom hostnames.
 - **Clipboard support.** Passing `-c` copies the link to the system clipboard via clipbridge, wl-copy, xclip, pbcopy, or clip.exe.
 - **Piped input.** Accepts file paths or pipeline logs on stdin. When piped from autodub, beam prioritizes the generated dubbed video over subtitle files and logs.
@@ -40,19 +41,23 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 Pipe autodub into beam. Beam prints the pipeline progress as it runs, picks the dubbed video file when finished, starts the server, and prints the link:
 
 ```sh
-./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
+# Share publicly over HTTPS tunnel
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+
+# Share locally or across your LAN
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
 ```
 
 You can also specify a Tailscale node or custom hostname:
 
 ```sh
-./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -H myhost.ts.net -c
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -H myhost.ts.net -c
 ```
 
 Or pipe an existing file path:
 
 ```sh
-ls -t output/*.mp4 | head -1 | beam -c
+ls -t output/*.mp4 | head -1 | beam -p -c
 ```
 
 ## Usage
@@ -61,8 +66,8 @@ ls -t output/*.mp4 | head -1 | beam -c
 # Share a video locally (default 5h lifetime)
 beam video.mp4
 
-# Pipe from autodub and copy link to clipboard
-./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
+# Pipe from autodub and share over a public HTTPS tunnel
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
 
 # Use a specific IP or Tailscale domain for the link
 beam -H 192.168.1.50 -c video.mp4
@@ -86,6 +91,7 @@ beam -w video.mp4
 | Flag | Description |
 |------|-------------|
 | `-t <ttl>` | Link lifetime. Default is `5h`. Accepts `s`, `m`, `h`, `d`. |
+| `-p` | Open an ephemeral public HTTPS reverse tunnel via SSH. |
 | `-H <host>` | Host or IP for the share link (for example, `192.168.1.50` or `node.ts.net`). |
 | `-c` | Copy the share URL to the system clipboard. |
 | `-q` | Quiet mode. Suppress the terminal QR code. |
