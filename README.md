@@ -42,7 +42,7 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 - **Host override.** Passing `-H host` sets the host, IP, or domain in the link. Useful for Tailscale nodes or custom hostnames.
 - **Clipboard support.** Passing `-c` copies the link to the system clipboard via clipbridge, wl-copy, xclip, pbcopy, or clip.exe.
 - **Piped input.** Accepts file paths or pipeline logs on stdin. When piped from autodub, beam prioritizes the generated dubbed video over subtitle files and logs.
-- **One-shot mode.** Passing `-1` exits immediately after the first complete transfer.
+- **One-shot mode.** Passing `-1` exits after the first complete file GET, or after the first viewer stops sending Range requests (native players).
 
 ## Piping from autodub
 

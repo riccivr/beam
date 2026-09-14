@@ -21,6 +21,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -56,6 +57,15 @@
 #endif
 
 #define KEEP_ALIVE_MS 15000
+#define KEEP_ALIVE_ONESHOT_MS 2000
+#define WORKER_EXIT_FULL 10
+#define WORKER_EXIT_RANGE 11
+
+static long monotonic_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000L + (long)tv.tv_usec / 1000L;
+}
 
 #ifndef VERSION
 #define VERSION "1.0.0"
@@ -825,7 +835,8 @@ static bool extract_token(const char *path, const char *expected_token, const ch
     return true;
 }
 
-/* Serve one HTTP request. Returns 1 if a complete non-range GET finished.
+/* Serve one HTTP request.
+ * Returns 1 if a complete non-range GET finished, 2 if a Range body was sent.
  * *keep_alive is updated from proto / Connection header. Does not close sock.
  */
 static int process_request(SOCKET client_sock, const BeamConfig *cfg,
@@ -1043,8 +1054,8 @@ static int process_request(SOCKET client_sock, const BeamConfig *cfg,
     if (is_get && content_length > 0) {
         if (!send_file_range(client_sock, fp, is_range ? range_start : 0, content_length))
             *keep_alive = false;
-        else if (!is_range)
-            complete = 1;
+        else
+            complete = is_range ? 2 : 1;
     } else if (is_get && content_length == 0 && !is_range) {
         complete = 1;
     }
@@ -1053,23 +1064,21 @@ static int process_request(SOCKET client_sock, const BeamConfig *cfg,
     return complete;
 }
 
-static int recv_request(SOCKET sock, char *buf, size_t buflen, int timeout_ms) {
-    size_t used = 0;
-    time_t deadline = time(NULL) + (timeout_ms + 999) / 1000;
+/* Append from sock into buf[*used]. Returns 1 when a full header is present. */
+static int recv_request(SOCKET sock, char *buf, size_t buflen, size_t *used, int timeout_ms) {
+    long deadline = monotonic_ms() + (long)timeout_ms;
 
-    if (buflen < 2)
+    if (!used || buflen < 2)
         return 0;
+    buf[*used] = '\0';
+    if (strstr(buf, "\r\n\r\n") != NULL)
+        return 1;
 
-    while (used + 1 < buflen) {
-        int wait_ms = timeout_ms;
-        time_t now = time(NULL);
-        if (used > 0) {
-            if (now >= deadline)
-                break;
-            wait_ms = (int)((deadline - now) * 1000);
-            if (wait_ms < 50)
-                wait_ms = 50;
-        }
+    while (*used + 1 < buflen) {
+        long now = monotonic_ms();
+        int wait_ms = (int)(deadline - now);
+        if (wait_ms < 0)
+            wait_ms = 0;
 
         struct pollfd pfd;
         pfd.fd = sock;
@@ -1081,50 +1090,67 @@ static int recv_request(SOCKET sock, char *buf, size_t buflen, int timeout_ms) {
             if (errno == EINTR)
                 continue;
 #endif
-            return used ? (int)used : 0;
+            return 0;
         }
         if (pr == 0)
-            return used ? (int)used : 0;
+            return 0;
 
-        int n = recv(sock, buf + used, (int)(buflen - 1 - used), 0);
+        int n = recv(sock, buf + *used, (int)(buflen - 1 - *used), 0);
         if (n <= 0)
-            return used ? (int)used : 0;
-        used += (size_t)n;
-        buf[used] = '\0';
+            return 0;
+        *used += (size_t)n;
+        buf[*used] = '\0';
         if (strstr(buf, "\r\n\r\n") != NULL)
-            return (int)used;
+            return 1;
     }
-    buf[used] = '\0';
-    return used ? (int)used : 0;
+    return 0;
 }
 
-/* Returns 1 if a complete non-range GET finished (for -1). */
+/* Returns 1 if a complete non-range GET finished, 2 if any Range body was sent. */
 static int handle_client(SOCKET client_sock, const BeamConfig *cfg) {
-    int complete = 0;
+    int served = 0;
     bool keep_alive = true;
+    int idle_ms = (cfg->max_downloads > 0) ? KEEP_ALIVE_ONESHOT_MS : KEEP_ALIVE_MS;
+    char req_buf[16384];
+    size_t have = 0;
 
     set_media_sockopts(client_sock);
 
-    char req_buf[8192];
-    int n = recv_request(client_sock, req_buf, sizeof(req_buf), 30000);
-    if (n <= 0) {
+    if (!recv_request(client_sock, req_buf, sizeof(req_buf), &have, 30000)) {
         close_socket(client_sock);
         return 0;
     }
 
     for (;;) {
+        char *hdrend = strstr(req_buf, "\r\n\r\n");
+        if (!hdrend)
+            break;
         int rc = process_request(client_sock, cfg, req_buf, &keep_alive);
         if (rc == 1)
-            complete = 1;
+            served = 1;
+        else if (rc == 2 && served == 0)
+            served = 2;
+
+        {
+            size_t consume = (size_t)(hdrend + 4 - req_buf);
+            if (consume > have)
+                consume = have;
+            have -= consume;
+            if (have)
+                memmove(req_buf, req_buf + consume, have);
+            req_buf[have] = '\0';
+        }
+
         if (!keep_alive || !running)
             break;
-        n = recv_request(client_sock, req_buf, sizeof(req_buf), KEEP_ALIVE_MS);
-        if (n <= 0)
+        if (strstr(req_buf, "\r\n\r\n") != NULL)
+            continue;
+        if (!recv_request(client_sock, req_buf, sizeof(req_buf), &have, idle_ms))
             break;
     }
 
     close_socket(client_sock);
-    return complete;
+    return served;
 }
 
 #ifndef _WIN32
@@ -1154,8 +1180,8 @@ static bool remux_faststart(BeamConfig *cfg) {
     fd = mkstemp(outpath);
     if (fd < 0)
         return false;
+    fchmod(fd, 0600);
     close(fd);
-    unlink(outpath);
 
     pid = fork();
     if (pid < 0)
@@ -1228,7 +1254,7 @@ static void usage(void) {
     fprintf(stderr, "  -H host   Host or IP for share link (e.g. 192.168.1.50, mynode.ts.net)\n");
     fprintf(stderr, "  -c        Copy share link to system clipboard\n");
     fprintf(stderr, "  -q        Quiet mode: suppress terminal QR code\n");
-    fprintf(stderr, "  -1        One-shot: exit after first complete download/view\n");
+    fprintf(stderr, "  -1        One-shot: exit after first full GET, or after the first viewer goes idle\n");
     fprintf(stderr, "  -w        HTML web player page (default: native browser stream)\n");
     fprintf(stderr, "  -f        Force MP4 faststart remux (ffmpeg -movflags +faststart)\n");
     fprintf(stderr, "  -F        Skip MP4 faststart remux\n");
@@ -1631,6 +1657,10 @@ int main(int argc, char *argv[]) {
 
     /* Event Loop */
     cfg.start_time = time(NULL);
+#ifndef _WIN32
+    int workers = 0;
+    int seen_range_viewer = 0;
+#endif
 
     while (running) {
         time_t now = time(NULL);
@@ -1665,9 +1695,17 @@ int main(int argc, char *argv[]) {
             while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
                 if (w == tunnel_pid)
                     continue;
-                if (WIFEXITED(st) && WEXITSTATUS(st) == 10)
+                if (workers > 0)
+                    workers--;
+                if (WIFEXITED(st) && WEXITSTATUS(st) == WORKER_EXIT_FULL)
                     cfg.download_count++;
+                else if (WIFEXITED(st) && WEXITSTATUS(st) == WORKER_EXIT_RANGE)
+                    seen_range_viewer = 1;
             }
+        }
+        if (cfg.max_downloads > 0 && seen_range_viewer && workers == 0) {
+            cfg.download_count++;
+            seen_range_viewer = 0;
         }
         if (cfg.max_downloads > 0 && cfg.download_count >= cfg.max_downloads) {
             printf("beam: download limit reached\n");
@@ -1752,18 +1790,21 @@ int main(int argc, char *argv[]) {
                     close_socket(server_sock);
                     if (tty_fd >= 0) close(tty_fd);
                     int rc = handle_client(client_sock, &cfg);
-                    _exit(rc == 1 ? 10 : 0);
+                    _exit(rc == 1 ? WORKER_EXIT_FULL : (rc == 2 ? WORKER_EXIT_RANGE : 0));
                 }
                 if (child > 0) {
+                    workers++;
                     close_socket(client_sock);
                 } else {
                     int rc = handle_client(client_sock, &cfg);
                     if (rc == 1)
                         cfg.download_count++;
+                    else if (rc == 2)
+                        cfg.download_count++;
                 }
 #else
                 int rc = handle_client(client_sock, &cfg);
-                if (rc == 1)
+                if (rc == 1 || rc == 2)
                     cfg.download_count++;
 #endif
             }
@@ -1777,9 +1818,17 @@ int main(int argc, char *argv[]) {
             while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
                 if (w == tunnel_pid)
                     continue;
-                if (WIFEXITED(st) && WEXITSTATUS(st) == 10)
+                if (workers > 0)
+                    workers--;
+                if (WIFEXITED(st) && WEXITSTATUS(st) == WORKER_EXIT_FULL)
                     cfg.download_count++;
+                else if (WIFEXITED(st) && WEXITSTATUS(st) == WORKER_EXIT_RANGE)
+                    seen_range_viewer = 1;
             }
+        }
+        if (cfg.max_downloads > 0 && seen_range_viewer && workers == 0) {
+            cfg.download_count++;
+            seen_range_viewer = 0;
         }
         if (cfg.max_downloads > 0 && cfg.download_count >= cfg.max_downloads) {
             printf("beam: download limit reached\n");

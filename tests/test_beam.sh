@@ -247,6 +247,22 @@ else
     echo "[PASS] One-shot server auto-terminated after download completed"
 fi
 
+echo "Testing one-shot mode after Range viewer idle (-1)..."
+ONESHOT_R_LOG="$TMP_DIR/oneshot_range.log"
+./beam -q -P 9893 -1 "$TEST_MP4" > "$ONESHOT_R_LOG" 2>&1 &
+BEAM_1R_PID=$!
+sleep 0.5
+ONESHOT_R_TOKEN=$(grep "Link:" "$ONESHOT_R_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
+curl -s -r 0-99 "http://127.0.0.1:9893/$ONESHOT_R_TOKEN" > /dev/null
+sleep 3
+if kill -0 $BEAM_1R_PID 2>/dev/null; then
+    echo "[FAIL] One-shot server still running after Range viewer went idle"
+    kill -9 $BEAM_1R_PID 2>/dev/null || true
+    exit 1
+else
+    echo "[PASS] One-shot server exited after Range requests went idle"
+fi
+
 # 11. Piped filepath test
 echo "Testing piped filepath..."
 PIPE_LOG="$TMP_DIR/pipe.log"
