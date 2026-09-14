@@ -33,11 +33,42 @@ Local-first, fast, and built specifically for sharing dubbed videos, recordings,
 - **Clipboard Integration (`-c`)**: Automatically copies the link to your system clipboard (`clipbridge`, `wl-copy`, `xclip`, `pbcopy`, or `clip.exe`).
 - **Suckless Standards**: Pure C99, `arg.h`, `config.mk`, `Makefile`, and `beam.1` man page. Zero dependencies beyond standard C and POSIX/OS sockets.
 
+## Integration with autodub
+
+`beam` was created out of the direct necessity to instantly share dubbed videos with your girlfriend right after generating them with [`autodub`](https://github.com/riccivr/autodub).
+
+Because `beam` understands standard input, you can pipe `autodub` directly into `beam`. It displays autodub's progress in real-time, automatically detects the finished dubbed `.mp4` file path upon completion, establishes an ephemeral public HTTPS tunnel, copies the link to your clipboard, and generates an on-screen QR code:
+
+```sh
+# Dub a YouTube video and instantly beam a short-lived link:
+./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+
+# Or beam the latest video from your output folder:
+ls -t output/*.mp4 | head -1 | beam -p -c
+```
+
+As soon as `autodub` finishes muxing, `beam` pops up:
+```
+  BEAM - Ephemeral File & Video Sharing
+  --------------------------------------------------
+  File:     Jacksepticeye_just_got_cancelled.._dubbed_es.mp4 (45.2 MB, video/mp4)
+  Expires:  in 18000 seconds (5h 0m)
+  Link:     https://xxxx.lhr.life/s/8f3a2c0b.../Jacksepticeye_just_got_cancelled.._dubbed_es.mp4
+            (copied to clipboard)
+
+  Scan with camera:
+  [QR CODE]
+```
+Send the link in chat (WhatsApp, Telegram, iMessage) or let her scan the QR code. She can open it and watch the video immediately in Chrome's native player with zero friction!
+
 ## Usage
 
 ```sh
 # Share a video (streams directly into Chrome/Safari native player, 5h TTL)
 beam video.mp4
+
+# Pipe output from a dubbing or conversion script
+./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
 
 # Share over the internet via public HTTPS tunnel + copy link to clipboard
 beam -p -c video.mp4

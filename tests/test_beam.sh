@@ -14,7 +14,7 @@ case "$VERSION_OUT" in
 esac
 
 # 2. Argument validation test
-if ./beam >/dev/null 2>&1; then
+if ./beam </dev/null >/dev/null 2>&1; then
     echo "[FAIL] Missing argument should fail"
     exit 1
 fi
@@ -203,6 +203,40 @@ if kill -0 $BEAM_1_PID 2>/dev/null; then
     exit 1
 else
     echo "[PASS] One-shot server auto-terminated after download completed"
+fi
+
+# 11. Piped filepath test
+echo "Testing piped filepath..."
+PIPE_LOG="$TMP_DIR/pipe.log"
+echo "$TEST_TXT" | ./beam -q -P 9874 -1 > "$PIPE_LOG" 2>&1 &
+PIPE_PID=$!
+sleep 0.5
+PIPE_TOKEN=$(grep "Link:" "$PIPE_LOG" | awk -F'/s/' '{print $2}' | awk -F'/' '{print $1}')
+if [ -n "$PIPE_TOKEN" ]; then
+    curl -s "http://127.0.0.1:9874/s/$PIPE_TOKEN/testfile.txt" > /dev/null
+    echo "[PASS] Piped filepath correctly picked up and served"
+else
+    echo "[FAIL] Failed to start server from piped filepath:"
+    cat "$PIPE_LOG"
+    kill $PIPE_PID 2>/dev/null || true
+    exit 1
+fi
+
+# 12. Piped autodub log simulation test
+echo "Testing piped autodub log simulation..."
+AUTODUB_LOG="$TMP_DIR/autodub_pipe.log"
+printf "[1/6] Preparing media...\n[6/6] Remuxing final video...\nCompleted:\n  Dubbed: %s\n" "$TEST_MP4" | ./beam -q -P 9875 -1 > "$AUTODUB_LOG" 2>&1 &
+AD_PID=$!
+sleep 0.5
+AD_TOKEN=$(grep "Link:" "$AUTODUB_LOG" | awk -F'/s/' '{print $2}' | awk -F'/' '{print $1}')
+if [ -n "$AD_TOKEN" ]; then
+    curl -s "http://127.0.0.1:9875/s/$AD_TOKEN/sample.mp4" > /dev/null
+    echo "[PASS] Piped autodub log correctly extracted Dubbed video path and served"
+else
+    echo "[FAIL] Failed to extract dubbed video from piped autodub log:"
+    cat "$AUTODUB_LOG"
+    kill $AD_PID 2>/dev/null || true
+    exit 1
 fi
 
 echo "=== All tests passed successfully! ==="

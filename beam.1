@@ -80,6 +80,12 @@ Share a dubbed video with default 5-hour lifetime:
 beam dubbed_video.mp4
 .EE
 .P
+Pipe directly from autodub to share a newly dubbed video automatically:
+.IP
+.EX
+autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+.EE
+.P
 Share a video over the internet with public HTTPS tunnel and copy link:
 .IP
 .EX

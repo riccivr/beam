@@ -55,6 +55,14 @@
 char *argv0;
 static volatile sig_atomic_t running = 1;
 static pid_t tunnel_pid = -1;
+static char global_temp_file[1024] = "";
+
+static void cleanup_temp_file(void) {
+    if (global_temp_file[0]) {
+        unlink(global_temp_file);
+        global_temp_file[0] = '\0';
+    }
+}
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -583,7 +591,7 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-p] [-c] [-q] [-1] [-w] [-b ip] [-P port] <file>\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-p] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
     fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (localhost.run)\n");
     fprintf(stderr, "  -c        Copy share link to system clipboard\n");
@@ -593,6 +601,10 @@ static void usage(void) {
     fprintf(stderr, "  -b ip     Bind IP address (default: 0.0.0.0)\n");
     fprintf(stderr, "  -P port   Listening port (default: 8080 or next available)\n");
     fprintf(stderr, "  -v        Show version\n");
+    fprintf(stderr, "\nNotes:\n");
+    fprintf(stderr, "  If no file is specified, beam reads from standard input.\n");
+    fprintf(stderr, "  Piping from tools like autodub echoes progress and auto-beams the output video:\n");
+    fprintf(stderr, "    autodub.sh \"https://www.youtube.com/watch?v=...\" | beam -p -c\n");
     exit(1);
 }
 
@@ -636,11 +648,103 @@ int main(int argc, char *argv[]) {
         usage();
     } ARGEND;
 
-    if (argc < 1) {
-        usage();
-    }
+    atexit(cleanup_temp_file);
 
-    snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", argv[0]);
+    bool is_temp_file = false;
+
+    if (argc < 1 || strcmp(argv[0], "-") == 0) {
+#ifndef _WIN32
+        if (argc < 1 && isatty(STDIN_FILENO)) {
+            usage();
+        }
+#endif
+        if (argc >= 1 && strcmp(argv[0], "-") == 0) {
+            /* Raw stdin stream: write to a temporary file */
+            char tmppath[] = "/tmp/beam_stream_XXXXXX";
+            int fd = mkstemp(tmppath);
+            if (fd < 0) {
+                fprintf(stderr, "beam: failed to create temporary file: %s\n", strerror(errno));
+                return 1;
+            }
+            char chunk[65536];
+            ssize_t n;
+            while ((n = read(STDIN_FILENO, chunk, sizeof(chunk))) > 0) {
+                if (write(fd, chunk, (size_t)n) != n) {
+                    fprintf(stderr, "beam: failed writing to temp file: %s\n", strerror(errno));
+                    close(fd);
+                    unlink(tmppath);
+                    return 1;
+                }
+            }
+            close(fd);
+            snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", tmppath);
+            snprintf(global_temp_file, sizeof(global_temp_file), "%s", tmppath);
+            is_temp_file = true;
+        } else {
+            /* Piped input from tools like autodub, find, ls, echo, etc. */
+            char line[4096];
+            char detected_file[1024] = "";
+            bool found_file = false;
+
+            while (fgets(line, sizeof(line), stdin)) {
+                /* Echo output in real-time so users see live pipeline progress */
+                fputs(line, stdout);
+                fflush(stdout);
+
+                char *start = line;
+                while (*start && isspace((unsigned char)*start)) start++;
+
+                char *end = start + strlen(start);
+                while (end > start && isspace((unsigned char)*(end - 1))) {
+                    end--;
+                    *end = '\0';
+                }
+                if (*start == '\0') continue;
+
+                if ((*start == '"' && *(end - 1) == '"') || (*start == '\'' && *(end - 1) == '\'')) {
+                    start++;
+                    *(end - 1) = '\0';
+                }
+
+                /* 1. Direct path check */
+                struct stat probe_st;
+                if (stat(start, &probe_st) == 0 && !S_ISDIR(probe_st.st_mode)) {
+                    snprintf(detected_file, sizeof(detected_file), "%.1023s", start);
+                    found_file = true;
+                    continue;
+                }
+
+                /* 2. Look for "Dubbed: <path>" or "output: <path>" */
+                const char *prefixes[] = {"Dubbed:", "output:", "Dubbed :", "output :", NULL};
+                for (int i = 0; prefixes[i] != NULL; i++) {
+                    char *sub = strstr(start, prefixes[i]);
+                    if (sub) {
+                        char *path_part = sub + strlen(prefixes[i]);
+                        while (*path_part && isspace((unsigned char)*path_part)) path_part++;
+                        char *p_end = path_part + strlen(path_part);
+                        while (p_end > path_part && isspace((unsigned char)*(p_end - 1))) {
+                            p_end--;
+                            *p_end = '\0';
+                        }
+                        if (stat(path_part, &probe_st) == 0 && !S_ISDIR(probe_st.st_mode)) {
+                            snprintf(detected_file, sizeof(detected_file), "%.1023s", path_part);
+                            found_file = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!found_file) {
+                fprintf(stderr, "\nbeam: error: no valid file path detected from piped input\n");
+                return 1;
+            }
+
+            snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", detected_file);
+        }
+    } else {
+        snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", argv[0]);
+    }
 
     /* Stat the target file */
     struct stat st;
@@ -656,15 +760,19 @@ int main(int argc, char *argv[]) {
     cfg.filesize = (int64_t)st.st_size;
 
     /* Extract filename */
-    const char *slash = strrchr(cfg.filepath, '/');
-#ifdef _WIN32
-    const char *bslash = strrchr(cfg.filepath, '\\');
-    if (bslash && (!slash || bslash > slash)) slash = bslash;
-#endif
-    if (slash) {
-        snprintf(cfg.filename, sizeof(cfg.filename), "%s", slash + 1);
+    if (is_temp_file) {
+        snprintf(cfg.filename, sizeof(cfg.filename), "stream.mp4");
     } else {
-        snprintf(cfg.filename, sizeof(cfg.filename), "%s", cfg.filepath);
+        const char *slash = strrchr(cfg.filepath, '/');
+#ifdef _WIN32
+        const char *bslash = strrchr(cfg.filepath, '\\');
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
+        if (slash) {
+            snprintf(cfg.filename, sizeof(cfg.filename), "%s", slash + 1);
+        } else {
+            snprintf(cfg.filename, sizeof(cfg.filename), "%s", cfg.filepath);
+        }
     }
 
     cfg.mimetype = beam_mime_type(cfg.filename);
