@@ -54,7 +54,6 @@
 
 char *argv0;
 static volatile sig_atomic_t running = 1;
-static pid_t tunnel_pid = -1;
 static char global_temp_file[1024] = "";
 
 static void cleanup_temp_file(void) {
@@ -67,6 +66,23 @@ static void cleanup_temp_file(void) {
 static void sig_handler(int sig) {
     (void)sig;
     running = 0;
+}
+
+static const char *ci_strstr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return haystack;
+    for (; *haystack; haystack++) {
+        if (tolower((unsigned char)*haystack) == tolower((unsigned char)*needle)) {
+            const char *h = haystack;
+            const char *n = needle;
+            while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+                h++;
+                n++;
+            }
+            if (!*n) return haystack;
+        }
+    }
+    return NULL;
 }
 
 const char *beam_mime_type(const char *path) {
@@ -96,6 +112,10 @@ const char *beam_mime_type(const char *path) {
     if (strcmp(lower, ".m4a") == 0) return "audio/mp4";
     if (strcmp(lower, ".flac") == 0) return "audio/flac";
     if (strcmp(lower, ".aac") == 0) return "audio/aac";
+
+    /* Subtitles */
+    if (strcmp(lower, ".srt") == 0) return "text/plain; charset=utf-8";
+    if (strcmp(lower, ".vtt") == 0) return "text/vtt; charset=utf-8";
 
     /* Images */
     if (strcmp(lower, ".jpg") == 0 || strcmp(lower, ".jpeg") == 0) return "image/jpeg";
@@ -256,76 +276,6 @@ static bool copy_to_clipboard(const char *text) {
     return false;
 }
 
-#ifndef _WIN32
-static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen) {
-    int pipefd[2];
-    if (pipe(pipefd) == -1) return false;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return false;
-    }
-
-    if (pid == 0) {
-        /* Child: redirect stdout & stderr to pipe */
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        char port_spec[64];
-        snprintf(port_spec, sizeof(port_spec), "80:localhost:%d", local_port);
-
-        execlp("ssh", "ssh",
-               "-T",
-               "-o", "StrictHostKeyChecking=no",
-               "-o", "UserKnownHostsFile=/dev/null",
-               "-o", "ExitOnForwardFailure=yes",
-               "-R", port_spec,
-               "nokey@localhost.run",
-               (char *)NULL);
-        _exit(1);
-    }
-
-    /* Parent */
-    close(pipefd[1]);
-    tunnel_pid = pid;
-
-    /* Read child output until we find the public URL */
-    char line[1024];
-    size_t line_len = 0;
-    time_t t_start = time(NULL);
-
-    while (time(NULL) - t_start < 10) {
-        char ch;
-        ssize_t n = read(pipefd[0], &ch, 1);
-        if (n <= 0) break;
-
-        if (ch == '\n' || ch == '\r') {
-            line[line_len] = '\0';
-            char *found = strstr(line, "https://");
-            if (found) {
-                /* Strip trailing space or punctuation */
-                char *end = found;
-                while (*end && !isspace((unsigned char)*end)) end++;
-                *end = '\0';
-                snprintf(public_url_out, maxlen, "%s", found);
-                close(pipefd[0]);
-                return true;
-            }
-            line_len = 0;
-        } else if (line_len + 1 < sizeof(line)) {
-            line[line_len++] = ch;
-        }
-    }
-
-    close(pipefd[0]);
-    return false;
-}
-#endif
-
 static void send_http_response(SOCKET sock, int status, const char *status_text,
                                const char *extra_headers, const char *body, size_t body_len) {
     char header[1024];
@@ -368,7 +318,7 @@ static void render_html_player(char *html, size_t maxlen, const BeamConfig *cfg)
              "<body>\n"
              "  <div class=\"container\">\n"
              "    <div class=\"video-card\">\n"
-             "      <video controls playsinline preload=\"metadata\" src=\"/s/%s/raw\">\n"
+             "      <video controls playsinline preload=\"metadata\" src=\"/%s/raw\">\n"
              "        Your browser does not support HTML5 video streaming.\n"
              "      </video>\n"
              "      <div class=\"meta-bar\">\n"
@@ -376,7 +326,7 @@ static void render_html_player(char *html, size_t maxlen, const BeamConfig *cfg)
              "          <span class=\"title\">%s</span>\n"
              "          <span class=\"badge\">%s</span>\n"
              "        </div>\n"
-             "        <a class=\"btn\" href=\"/s/%s/raw\" download=\"%s\">Download</a>\n"
+             "        <a class=\"btn\" href=\"/%s/raw\" download=\"%s\">Download</a>\n"
              "      </div>\n"
              "    </div>\n"
              "  </div>\n"
@@ -388,20 +338,47 @@ static void render_html_player(char *html, size_t maxlen, const BeamConfig *cfg)
              cfg->token, cfg->filename);
 }
 
-static void url_encode_filename(const char *src, char *dst, size_t maxlen) {
-    static const char hex[] = "0123456789ABCDEF";
-    size_t d = 0;
-    for (size_t s = 0; src[s] && (d + 4) < maxlen; s++) {
-        unsigned char c = (unsigned char)src[s];
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            dst[d++] = (char)c;
-        } else {
-            dst[d++] = '%';
-            dst[d++] = hex[(c >> 4) & 0x0F];
-            dst[d++] = hex[c & 0x0F];
-        }
+/*
+ * Extract and validate token from requested URI.
+ * Accepts:
+ *   /<token>
+ *   /<token>/...
+ *   /?v=<token>
+ *   /?token=<token>
+ *   /?<token>
+ *   /s/<token>
+ *   /s/<token>/...
+ */
+static bool extract_token(const char *path, const char *expected_token, const char **subpath_out) {
+    if (!path || path[0] != '/') return false;
+
+    const char *p = path;
+    if (strncmp(p, "/s/", 3) == 0) {
+        p += 3;
+    } else if (strncmp(p, "/?v=", 4) == 0) {
+        p += 4;
+    } else if (strncmp(p, "/?token=", 8) == 0) {
+        p += 8;
+    } else if (strncmp(p, "/?", 2) == 0) {
+        p += 2;
+    } else {
+        p += 1;
     }
-    dst[d] = '\0';
+
+    size_t elen = strlen(expected_token);
+    if (strncmp(p, expected_token, elen) != 0) {
+        return false;
+    }
+
+    char next = p[elen];
+    if (next != '\0' && next != '/' && next != '?' && next != '#') {
+        return false;
+    }
+
+    if (subpath_out) {
+        *subpath_out = p + elen;
+    }
+    return true;
 }
 
 static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_handled) {
@@ -432,22 +409,24 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
         return;
     }
 
-    /* Check prefix: /s/<token> */
-    char token_prefix[64];
-    snprintf(token_prefix, sizeof(token_prefix), "/s/%s", cfg->token);
-    size_t tlen = strlen(token_prefix);
-
-    if (strncmp(path, token_prefix, tlen) != 0) {
+    const char *subpath = NULL;
+    if (!extract_token(path, cfg->token, &subpath)) {
         send_http_response(client_sock, 404, "Not Found", NULL, "404 Not Found\n", 14);
         close_socket(client_sock);
         return;
     }
 
-    const char *subpath = path + tlen;
+    /* HTML web player page if explicitly enabled or requested */
+    bool want_player = false;
+    if (cfg->web_player && beam_is_media(cfg->mimetype)) {
+        if (!subpath || (strcmp(subpath, "/raw") != 0 && strcmp(subpath, "/raw/") != 0)) {
+            want_player = true;
+        }
+    } else if (subpath && (strcmp(subpath, "/player") == 0 || strcmp(subpath, "/player/") == 0)) {
+        want_player = true;
+    }
 
-    /* Optional web player wrapper if -w is enabled and requested via /player */
-    if (cfg->web_player && beam_is_media(cfg->mimetype) &&
-        (strcmp(subpath, "/player") == 0 || strcmp(subpath, "/player/") == 0)) {
+    if (want_player) {
         char html[8192];
         render_html_player(html, sizeof(html), cfg);
         size_t hlen = strlen(html);
@@ -457,7 +436,7 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
         return;
     }
 
-    /* Open the file for direct inline streaming / range playback */
+    /* Stream raw file directly with inline disposition so browser plays video */
     FILE *fp = fopen(cfg->filepath, "rb");
     if (!fp) {
         send_http_response(client_sock, 500, "Internal Server Error", NULL, "Failed to read file\n", 20);
@@ -591,21 +570,102 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-p] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-H host] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
-    fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (localhost.run)\n");
+    fprintf(stderr, "  -H host   Host or IP for share link (e.g. 192.168.1.50, mynode.ts.net)\n");
     fprintf(stderr, "  -c        Copy share link to system clipboard\n");
     fprintf(stderr, "  -q        Quiet mode: suppress terminal QR code\n");
     fprintf(stderr, "  -1        One-shot: exit after first complete download/view\n");
-    fprintf(stderr, "  -w        HTML web player page (default: native browser player)\n");
+    fprintf(stderr, "  -w        HTML web player page (default: native browser stream)\n");
     fprintf(stderr, "  -b ip     Bind IP address (default: 0.0.0.0)\n");
     fprintf(stderr, "  -P port   Listening port (default: 8080 or next available)\n");
     fprintf(stderr, "  -v        Show version\n");
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "  If no file is specified, beam reads from standard input.\n");
-    fprintf(stderr, "  Piping from tools like autodub echoes progress and auto-beams the output video:\n");
-    fprintf(stderr, "    autodub.sh \"https://www.youtube.com/watch?v=...\" | beam -p -c\n");
+    fprintf(stderr, "  Piping from autodub echoes progress and shares the dubbed video:\n");
+    fprintf(stderr, "    autodub.sh \"https://www.youtube.com/watch?v=...\" | beam -c\n");
     exit(1);
+}
+
+static bool check_and_record_file(const char *candidate,
+                                  const char *line,
+                                  char *dubbed_video,
+                                  char *any_video,
+                                  char *any_media,
+                                  char *last_file) {
+    if (!candidate || !*candidate) return false;
+
+    /* Strip surrounding quotes if present */
+    char clean[1024];
+    const char *start = candidate;
+    while (*start && isspace((unsigned char)*start)) start++;
+    size_t clen = strlen(start);
+    while (clen > 0 && isspace((unsigned char)start[clen - 1])) clen--;
+
+    if ((start[0] == '"' && start[clen - 1] == '"') ||
+        (start[0] == '\'' && start[clen - 1] == '\'')) {
+        start++;
+        clen -= 2;
+    }
+    if (clen == 0 || clen >= sizeof(clean)) return false;
+    memcpy(clean, start, clen);
+    clean[clen] = '\0';
+
+    struct stat st;
+    if (stat(clean, &st) != 0 || S_ISDIR(st.st_mode)) {
+        return false;
+    }
+
+    const char *mime = beam_mime_type(clean);
+    bool is_video = (strncmp(mime, "video/", 6) == 0);
+    bool is_media = beam_is_media(mime);
+
+    bool is_dubbed = (ci_strstr(line, "dubbed") != NULL ||
+                      ci_strstr(line, "output") != NULL ||
+                      ci_strstr(clean, "dubbed") != NULL);
+
+    if (is_dubbed && is_video) {
+        snprintf(dubbed_video, 1024, "%s", clean);
+    }
+    if (is_video) {
+        snprintf(any_video, 1024, "%s", clean);
+    }
+    if (is_media) {
+        snprintf(any_media, 1024, "%s", clean);
+    }
+    snprintf(last_file, 1024, "%s", clean);
+    return true;
+}
+
+static void parse_line_candidates(const char *line,
+                                  char *dubbed_video,
+                                  char *any_video,
+                                  char *any_media,
+                                  char *last_file) {
+    /* 1. Whole line (trimmed) */
+    check_and_record_file(line, line, dubbed_video, any_video, any_media, last_file);
+
+    /* 2. Prefixes like "Dubbed:", "output:", "File:", "Saved:" */
+    static const char *prefixes[] = {
+        "Dubbed:", "output:", "Output:", "Dubbed :", "output :",
+        "Video:", "Saved:", "File:", NULL
+    };
+    for (int i = 0; prefixes[i] != NULL; i++) {
+        const char *sub = ci_strstr(line, prefixes[i]);
+        if (sub) {
+            check_and_record_file(sub + strlen(prefixes[i]), line,
+                                  dubbed_video, any_video, any_media, last_file);
+        }
+    }
+
+    /* 3. Word tokens separated by whitespace */
+    char copy[4096];
+    snprintf(copy, sizeof(copy), "%s", line);
+    char *token = strtok(copy, " \t\r\n");
+    while (token) {
+        check_and_record_file(token, line, dubbed_video, any_video, any_media, last_file);
+        token = strtok(NULL, " \t\r\n");
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -620,8 +680,8 @@ int main(int argc, char *argv[]) {
     case 't':
         cfg.ttl_seconds = beam_parse_duration(EARGF(usage()));
         break;
-    case 'p':
-        cfg.public_tunnel = true;
+    case 'H':
+        snprintf(cfg.host, sizeof(cfg.host), "%s", EARGF(usage()));
         break;
     case 'c':
         cfg.copy_clipboard = true;
@@ -683,64 +743,36 @@ int main(int argc, char *argv[]) {
         } else {
             /* Piped input from tools like autodub, find, ls, echo, etc. */
             char line[4096];
-            char detected_file[1024] = "";
-            bool found_file = false;
+            char dubbed_video[1024] = "";
+            char any_video[1024] = "";
+            char any_media[1024] = "";
+            char last_file[1024] = "";
 
             while (fgets(line, sizeof(line), stdin)) {
                 /* Echo output in real-time so users see live pipeline progress */
                 fputs(line, stdout);
                 fflush(stdout);
 
-                char *start = line;
-                while (*start && isspace((unsigned char)*start)) start++;
-
-                char *end = start + strlen(start);
-                while (end > start && isspace((unsigned char)*(end - 1))) {
-                    end--;
-                    *end = '\0';
-                }
-                if (*start == '\0') continue;
-
-                if ((*start == '"' && *(end - 1) == '"') || (*start == '\'' && *(end - 1) == '\'')) {
-                    start++;
-                    *(end - 1) = '\0';
-                }
-
-                /* 1. Direct path check */
-                struct stat probe_st;
-                if (stat(start, &probe_st) == 0 && !S_ISDIR(probe_st.st_mode)) {
-                    snprintf(detected_file, sizeof(detected_file), "%.1023s", start);
-                    found_file = true;
-                    continue;
-                }
-
-                /* 2. Look for "Dubbed: <path>" or "output: <path>" */
-                const char *prefixes[] = {"Dubbed:", "output:", "Dubbed :", "output :", NULL};
-                for (int i = 0; prefixes[i] != NULL; i++) {
-                    char *sub = strstr(start, prefixes[i]);
-                    if (sub) {
-                        char *path_part = sub + strlen(prefixes[i]);
-                        while (*path_part && isspace((unsigned char)*path_part)) path_part++;
-                        char *p_end = path_part + strlen(path_part);
-                        while (p_end > path_part && isspace((unsigned char)*(p_end - 1))) {
-                            p_end--;
-                            *p_end = '\0';
-                        }
-                        if (stat(path_part, &probe_st) == 0 && !S_ISDIR(probe_st.st_mode)) {
-                            snprintf(detected_file, sizeof(detected_file), "%.1023s", path_part);
-                            found_file = true;
-                            break;
-                        }
-                    }
-                }
+                parse_line_candidates(line, dubbed_video, any_video, any_media, last_file);
             }
 
-            if (!found_file) {
+            char chosen_file[1024] = "";
+            if (dubbed_video[0]) {
+                snprintf(chosen_file, sizeof(chosen_file), "%s", dubbed_video);
+            } else if (any_video[0]) {
+                snprintf(chosen_file, sizeof(chosen_file), "%s", any_video);
+            } else if (any_media[0]) {
+                snprintf(chosen_file, sizeof(chosen_file), "%s", any_media);
+            } else if (last_file[0]) {
+                snprintf(chosen_file, sizeof(chosen_file), "%s", last_file);
+            }
+
+            if (!chosen_file[0]) {
                 fprintf(stderr, "\nbeam: error: no valid file path detected from piped input\n");
                 return 1;
             }
 
-            snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", detected_file);
+            snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", chosen_file);
         }
     } else {
         snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", argv[0]);
@@ -825,28 +857,29 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Resolve sharing URL with encoded filename */
-    char share_url[4096];
-    char enc_filename[1024];
-    url_encode_filename(cfg.filename, enc_filename, sizeof(enc_filename));
-    bool tunnel_ok = false;
-
-#ifndef _WIN32
-    if (cfg.public_tunnel) {
-        fprintf(stderr, "beam: establishing public tunnel...\n");
-        if (start_ssh_tunnel(cfg.port, cfg.public_url, sizeof(cfg.public_url))) {
-            snprintf(share_url, sizeof(share_url), "%s/s/%s/%s", cfg.public_url, cfg.token, enc_filename);
-            tunnel_ok = true;
-        } else {
-            fprintf(stderr, "beam: warning: public tunnel failed, falling back to local network\n");
-        }
+    /* Build clean sharing URL: http://<host>:<port>/<token> */
+    char share_url[2048];
+    char host_str[256];
+    if (cfg.host[0]) {
+        snprintf(host_str, sizeof(host_str), "%s", cfg.host);
+    } else {
+        beam_detect_local_ip(host_str, sizeof(host_str));
     }
-#endif
 
-    if (!tunnel_ok) {
-        char local_ip[64];
-        beam_detect_local_ip(local_ip, sizeof(local_ip));
-        snprintf(share_url, sizeof(share_url), "http://%s:%d/s/%s/%s", local_ip, cfg.port, cfg.token, enc_filename);
+    if (strstr(host_str, "://")) {
+        /* Full scheme specified, e.g. https://tunnel.example.com */
+        if (strchr(host_str + 8, ':')) {
+            snprintf(share_url, sizeof(share_url), "%s/%s", host_str, cfg.token);
+        } else {
+            snprintf(share_url, sizeof(share_url), "%s:%d/%s", host_str, cfg.port, cfg.token);
+        }
+    } else {
+        if (strchr(host_str, ':')) {
+            /* Port already included in host argument */
+            snprintf(share_url, sizeof(share_url), "http://%s/%s", host_str, cfg.token);
+        } else {
+            snprintf(share_url, sizeof(share_url), "http://%s:%d/%s", host_str, cfg.port, cfg.token);
+        }
     }
 
     /* Set signal handlers */
@@ -933,12 +966,7 @@ int main(int argc, char *argv[]) {
     /* Cleanup */
     close_socket(server_sock);
 
-#ifndef _WIN32
-    if (tunnel_pid > 0) {
-        kill(tunnel_pid, SIGTERM);
-        waitpid(tunnel_pid, NULL, WNOHANG);
-    }
-#else
+#ifdef _WIN32
     WSACleanup();
 #endif
 

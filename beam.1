@@ -3,9 +3,11 @@
 beam \- ephemeral file and video sharing utility
 .SH SYNOPSIS
 .B beam
-.RB [ \-1cpqvw ]
+.RB [ \-1cqvw ]
 .RB [ \-t
 .IR ttl ]
+.RB [ \-H
+.IR host ]
 .RB [ \-b
 .IR ip ]
 .RB [ \-P
@@ -15,12 +17,13 @@ beam \- ephemeral file and video sharing utility
 .B beam
 serves a local file over HTTP using a temporary, random URL.
 .P
-When you share video, browsers open their native media player.
+When sharing video, browsers open their native media player.
 .B beam
 handles HTTP 206 Partial Content range requests so browsers can seek through
 MP4 and WebM files without downloading the entire file first.
 .P
-The URL path contains a random 128-bit hex token.
+The URL path contains a random 12-character hex token (for example,
+.IR http://192.168.1.50:8080/4bdaa908ed74 ).
 .B beam
 renders an ANSI QR code in the terminal using Unicode half-blocks and exits
 when the lifetime timer expires (default: 5 hours).
@@ -30,7 +33,7 @@ If no file argument is given,
 reads standard input. When piped from pipeline tools like
 .BR autodub ,
 it echoes progress output to the terminal in real time and automatically
-extracts the resulting output video path when the upstream process finishes.
+picks the generated dubbed video over subtitle files and logs.
 .SH OPTIONS
 .TP
 .BI \-t " ttl"
@@ -43,8 +46,11 @@ or
 are supported. Default is
 .BR 5h .
 .TP
-.B \-p
-Open an ephemeral public HTTPS reverse tunnel via SSH through localhost.run.
+.BI \-H " host"
+Specify the host, IP address, or domain name to use in the share link (for example,
+.BR 192.168.1.50
+or
+.BR mynode.ts.net ).
 .TP
 .B \-c
 Copy the share URL to the system clipboard using
@@ -82,16 +88,16 @@ Share a video locally with default 5-hour lifetime:
 beam dubbed_video.mp4
 .EE
 .P
-Pipe from autodub to share a newly dubbed video over a public tunnel:
+Pipe from autodub to share a newly dubbed video and copy link:
 .IP
 .EX
-autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
 .EE
 .P
-Share a file over the internet with public HTTPS tunnel and copy link:
+Share a file using a Tailscale hostname:
 .IP
 .EX
-beam -p -c dubbed_video.mp4
+beam -H mynode.ts.net -c dubbed_video.mp4
 .EE
 .P
 Share an archive valid for 30 minutes in one-shot mode:
@@ -99,11 +105,7 @@ Share an archive valid for 30 minutes in one-shot mode:
 .EX
 beam -t 30m -1 archive.zip
 .EE
-.P
-Share without terminal QR code on port 9000:
-.IP
-.EX
-beam -q -P 9000 document.pdf
-.EE
+.SH SEE ALSO
+.BR autodub (1)
 .SH AUTHORS
-See the LICENSE file for authors and copyright details.
+riccivr

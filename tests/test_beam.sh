@@ -32,6 +32,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 TEST_TXT="$TMP_DIR/testfile.txt"
 TEST_MP4="$TMP_DIR/sample.mp4"
+TEST_SRT="$TMP_DIR/sample_es.srt"
 
 # Generate 1KB deterministic test file
 awk 'BEGIN { for (i=1; i<=100; i++) printf "Line %04d: Hello beam streaming test!\n", i }' > "$TEST_TXT"
@@ -40,6 +41,9 @@ TXT_SIZE=$(wc -c < "$TEST_TXT" | tr -d ' ')
 # Generate dummy MP4 binary content
 head -c 2048 /dev/urandom > "$TEST_MP4"
 MP4_SIZE=$(wc -c < "$TEST_MP4" | tr -d ' ')
+
+# Generate dummy SRT file
+printf "1\n00:00:00,000 --> 00:00:02,000\nHello world\n" > "$TEST_SRT"
 
 # 3. HTTP Server & Endpoints test with sample.mp4
 TEST_PORT=9871
@@ -51,23 +55,18 @@ sleep 0.5
 
 # Extract link & token from log
 LINK_LINE=$(grep "Link:" "$OUTPUT_LOG" || true)
-TOKEN=$(echo "$LINK_LINE" | awk -F'/s/' '{print $2}' | awk -F'/' '{print $1}')
+TOKEN=$(grep "Link:" "$OUTPUT_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
 
-if [ -z "$TOKEN" ]; then
-    echo "[FAIL] Could not extract token from output:"
+if [ -z "$TOKEN" ] || [ ${#TOKEN} -ne 12 ]; then
+    echo "[FAIL] Could not extract valid 12-char token from output:"
     cat "$OUTPUT_LOG"
     kill $BEAM_PID 2>/dev/null || true
     exit 1
 fi
-echo "[PASS] Started beam server on port $TEST_PORT, token=$TOKEN"
-
-case "$LINK_LINE" in
-    *"sample.mp4"*) echo "[PASS] Generated share URL includes filename for native browser playback" ;;
-    *) echo "[FAIL] Share URL does not include filename: $LINK_LINE"; kill $BEAM_PID 2>/dev/null || true; exit 1 ;;
-esac
+echo "[PASS] Started beam server on port $TEST_PORT, token=$TOKEN (12 hex chars)"
 
 # 4. Invalid path and invalid token check
-STATUS_404=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$TEST_PORT/s/badtoken")
+STATUS_404=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$TEST_PORT/badtoken")
 if [ "$STATUS_404" = "404" ]; then
     echo "[PASS] Invalid token returns 404"
 else
@@ -85,20 +84,30 @@ else
     exit 1
 fi
 
-# 5. Direct native browser stream check (Content-Type, Content-Disposition inline, Accept-Ranges)
-STREAM_RESP=$(curl -s -i "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4")
+# 5. Direct native browser stream check on clean path param: /$TOKEN
+STREAM_RESP=$(curl -s -i "http://127.0.0.1:$TEST_PORT/$TOKEN")
 if echo "$STREAM_RESP" | grep -q "Content-Type: video/mp4" && \
    echo "$STREAM_RESP" | grep -q "Content-Disposition: inline; filename=\"sample.mp4\"" && \
    echo "$STREAM_RESP" | grep -q "Accept-Ranges: bytes"; then
-    echo "[PASS] Native browser stream headers correct (inline disposition, video/mp4, Accept-Ranges)"
+    echo "[PASS] Clean path /$TOKEN returns correct stream headers (video/mp4, inline disposition)"
 else
-    echo "[FAIL] Native stream headers unexpected:\n$STREAM_RESP"
+    echo "[FAIL] Stream headers unexpected:\n$STREAM_RESP"
+    kill $BEAM_PID 2>/dev/null || true
+    exit 1
+fi
+
+# Query param format check: /?v=$TOKEN
+PARAM_RESP=$(curl -s -i "http://127.0.0.1:$TEST_PORT/?v=$TOKEN")
+if echo "$PARAM_RESP" | grep -q "Content-Type: video/mp4"; then
+    echo "[PASS] Query param /?v=$TOKEN supported"
+else
+    echo "[FAIL] Query param /?v=$TOKEN failed:\n$PARAM_RESP"
     kill $BEAM_PID 2>/dev/null || true
     exit 1
 fi
 
 # 6. Full file download check
-curl -s "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4" > "$TMP_DIR/downloaded.mp4"
+curl -s "http://127.0.0.1:$TEST_PORT/$TOKEN" > "$TMP_DIR/downloaded.mp4"
 if cmp -s "$TEST_MP4" "$TMP_DIR/downloaded.mp4"; then
     echo "[PASS] Full file download matches byte-for-byte"
 else
@@ -109,7 +118,7 @@ fi
 
 # 7. Range requests (HTTP 206 Partial Content)
 # Request first 10 bytes: bytes=0-9
-curl -s -H "Range: bytes=0-9" -i "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4" > "$TMP_DIR/range1.out"
+curl -s -H "Range: bytes=0-9" -i "http://127.0.0.1:$TEST_PORT/$TOKEN" > "$TMP_DIR/range1.out"
 if grep -q "206 Partial Content" "$TMP_DIR/range1.out" && \
    grep -q "Content-Range: bytes 0-9/$MP4_SIZE" "$TMP_DIR/range1.out" && \
    grep -q "Content-Length: 10" "$TMP_DIR/range1.out"; then
@@ -122,7 +131,7 @@ else
 fi
 
 # Request middle slice: bytes=50-99 (50 bytes)
-curl -s -H "Range: bytes=50-99" -i "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4" > "$TMP_DIR/range2.out"
+curl -s -H "Range: bytes=50-99" -i "http://127.0.0.1:$TEST_PORT/$TOKEN" > "$TMP_DIR/range2.out"
 if grep -q "206 Partial Content" "$TMP_DIR/range2.out" && \
    grep -q "Content-Range: bytes 50-99/$MP4_SIZE" "$TMP_DIR/range2.out" && \
    grep -q "Content-Length: 50" "$TMP_DIR/range2.out"; then
@@ -136,7 +145,7 @@ fi
 # Request suffix range: bytes=-100 (last 100 bytes)
 START_SUFFIX=$((MP4_SIZE - 100))
 END_SUFFIX=$((MP4_SIZE - 1))
-curl -s -H "Range: bytes=-100" -i "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4" > "$TMP_DIR/range3.out"
+curl -s -H "Range: bytes=-100" -i "http://127.0.0.1:$TEST_PORT/$TOKEN" > "$TMP_DIR/range3.out"
 if grep -q "206 Partial Content" "$TMP_DIR/range3.out" && \
    grep -q "Content-Range: bytes $START_SUFFIX-$END_SUFFIX/$MP4_SIZE" "$TMP_DIR/range3.out" && \
    grep -q "Content-Length: 100" "$TMP_DIR/range3.out"; then
@@ -148,7 +157,7 @@ else
 fi
 
 # Invalid range request: bytes=999999-
-STATUS_416=$(curl -s -o /dev/null -w "%{http_code}" -H "Range: bytes=999999-9999999" "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4")
+STATUS_416=$(curl -s -o /dev/null -w "%{http_code}" -H "Range: bytes=999999-9999999" "http://127.0.0.1:$TEST_PORT/$TOKEN")
 if [ "$STATUS_416" = "416" ]; then
     echo "[PASS] Invalid range returns 416 Range Not Satisfiable"
 else
@@ -158,7 +167,7 @@ else
 fi
 
 # 8. HEAD request check
-HEAD_RESP=$(curl -s -I "http://127.0.0.1:$TEST_PORT/s/$TOKEN/sample.mp4")
+HEAD_RESP=$(curl -s -I "http://127.0.0.1:$TEST_PORT/$TOKEN")
 if echo "$HEAD_RESP" | grep -q "HTTP/1.1 200 OK" && \
    echo "$HEAD_RESP" | grep -q "Accept-Ranges: bytes" && \
    echo "$HEAD_RESP" | grep -q "Content-Length: $MP4_SIZE"; then
@@ -192,9 +201,9 @@ ONESHOT_LOG="$TMP_DIR/oneshot.log"
 ./beam -q -P 9873 -1 "$TEST_TXT" > "$ONESHOT_LOG" 2>&1 &
 BEAM_1_PID=$!
 sleep 0.5
-ONESHOT_TOKEN=$(grep "Link:" "$ONESHOT_LOG" | awk -F'/s/' '{print $2}' | awk -F'/' '{print $1}')
+ONESHOT_TOKEN=$(grep "Link:" "$ONESHOT_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
 
-curl -s "http://127.0.0.1:9873/s/$ONESHOT_TOKEN/testfile.txt" > /dev/null
+curl -s "http://127.0.0.1:9873/$ONESHOT_TOKEN" > /dev/null
 sleep 0.5
 
 if kill -0 $BEAM_1_PID 2>/dev/null; then
@@ -211,9 +220,9 @@ PIPE_LOG="$TMP_DIR/pipe.log"
 echo "$TEST_TXT" | ./beam -q -P 9874 -1 > "$PIPE_LOG" 2>&1 &
 PIPE_PID=$!
 sleep 0.5
-PIPE_TOKEN=$(grep "Link:" "$PIPE_LOG" | awk -F'/s/' '{print $2}' | awk -F'/' '{print $1}')
+PIPE_TOKEN=$(grep "Link:" "$PIPE_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
 if [ -n "$PIPE_TOKEN" ]; then
-    curl -s "http://127.0.0.1:9874/s/$PIPE_TOKEN/testfile.txt" > /dev/null
+    curl -s "http://127.0.0.1:9874/$PIPE_TOKEN" > /dev/null
     echo "[PASS] Piped filepath correctly picked up and served"
 else
     echo "[FAIL] Failed to start server from piped filepath:"
@@ -222,21 +231,43 @@ else
     exit 1
 fi
 
-# 12. Piped autodub log simulation test
-echo "Testing piped autodub log simulation..."
+# 12. Piped autodub log test: video followed by subtitles
+echo "Testing piped autodub log with Dubbed video followed by Subs srt..."
 AUTODUB_LOG="$TMP_DIR/autodub_pipe.log"
-printf "[1/6] Preparing media...\n[6/6] Remuxing final video...\nCompleted:\n  Dubbed: %s\n" "$TEST_MP4" | ./beam -q -P 9875 -1 > "$AUTODUB_LOG" 2>&1 &
+printf "[1/6] Preparing media...\n[6/6] Remuxing final video...\nCompleted:\n  Dubbed: %s\n  Subs: %s\nDone!\n" "$TEST_MP4" "$TEST_SRT" | ./beam -q -P 9875 -1 > "$AUTODUB_LOG" 2>&1 &
 AD_PID=$!
 sleep 0.5
-AD_TOKEN=$(grep "Link:" "$AUTODUB_LOG" | awk -F'/s/' '{print $2}' | awk -F'/' '{print $1}')
+AD_TOKEN=$(grep "Link:" "$AUTODUB_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
 if [ -n "$AD_TOKEN" ]; then
-    curl -s "http://127.0.0.1:9875/s/$AD_TOKEN/sample.mp4" > /dev/null
-    echo "[PASS] Piped autodub log correctly extracted Dubbed video path and served"
+    RESP=$(curl -s -i "http://127.0.0.1:9875/$AD_TOKEN")
+    if echo "$RESP" | grep -q "video/mp4" && echo "$RESP" | grep -q "sample.mp4"; then
+        echo "[PASS] Autodub output prioritized MP4 over SRT subtitles"
+    else
+        echo "[FAIL] Autodub output selected wrong file:\n$RESP"
+        kill $AD_PID 2>/dev/null || true
+        exit 1
+    fi
 else
     echo "[FAIL] Failed to extract dubbed video from piped autodub log:"
     cat "$AUTODUB_LOG"
     kill $AD_PID 2>/dev/null || true
     exit 1
 fi
+
+# 13. Custom host flag (-H) test
+echo "Testing custom host flag (-H)..."
+HOST_LOG="$TMP_DIR/host.log"
+./beam -q -P 9876 -H "tailscale.example.com" -t 5s "$TEST_TXT" > "$HOST_LOG" 2>&1 &
+HOST_PID=$!
+sleep 0.5
+if grep -q "http://tailscale.example.com:9876/" "$HOST_LOG"; then
+    echo "[PASS] -H host reflected in share link"
+else
+    echo "[FAIL] -H host not found in output:"
+    cat "$HOST_LOG"
+    kill $HOST_PID 2>/dev/null || true
+    exit 1
+fi
+kill $HOST_PID 2>/dev/null || true
 
 echo "=== All tests passed successfully! ==="

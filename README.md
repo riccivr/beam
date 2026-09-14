@@ -1,17 +1,17 @@
 # beam
 
-`beam` shares a local file over HTTP using a temporary, random URL.
+beam shares a local file over HTTP using a short-lived link.
 
-When you share a video, browsers like Chrome and Safari open their built-in player. Seeking works because the server handles HTTP Range requests (`206 Partial Content`). When the timer runs out, the server shuts down.
+When you share a video, Chrome, Safari, and other browsers open it directly in their native media player. Seeking works because beam responds to HTTP Range requests (206 Partial Content). When the timer expires, the server exits.
 
-I built `beam` because I use `autodub` to dub videos for my girlfriend and wanted a quick way to let her watch them without uploading gigabytes to cloud services.
+I built beam because I use autodub to dub videos for my girlfriend and wanted a direct way to let her watch them without uploading to third-party services.
 
 ```
   beam
   --------------------------------------------------
   File:     dubbed_video.mp4 (42.5 MB, video/mp4)
   Expires:  18000 seconds (5h 0m)
-  Link:     http://192.168.1.50:8080/s/8f3a2c0b1e4d5a6f7b8c9d0e1f2a3b4c/dubbed_video.mp4
+  Link:     http://192.168.1.50:8080/4bdaa908ed74
             (copied to clipboard)
 
   Scan with camera:
@@ -25,40 +25,48 @@ I built `beam` because I use `autodub` to dub videos for my girlfriend and wante
 
 ## How it works
 
-- **Direct browser playback.** Links include the filename and MIME type. Chrome, Safari, and Firefox open the video directly in their native media player.
-- **Range seeking.** Supports single-range byte requests so mobile and desktop browsers can scrub through MP4 and WebM containers.
-- **Terminal QR code.** Renders a QR code with Unicode half-blocks (`▀`, `▄`) so someone nearby can scan it with a phone camera.
-- **Auto expiration.** Sets a default five-hour lifetime (`-t 5h`), or any duration using `s`, `m`, `h`, or `d`.
-- **Public tunnel.** Passing `-p` opens an SSH reverse tunnel through `localhost.run`, which gives you an HTTPS URL reachable over cellular or outside your home network.
-- **Clipboard support.** Passing `-c` pipes the link to `clipbridge`, `wl-copy`, `xclip`, `pbcopy`, or `clip.exe`.
-- **Piped input.** Accepts file paths or pipeline logs on stdin and extracts the output file automatically.
-- **One-shot mode.** Passing `-1` stops the server after the first complete transfer.
+- **Direct browser playback.** Beam serves files with `Content-Disposition: inline` and matching MIME types. Browsers open audio and video files in their native media controls.
+- **Clean hash URLs.** Links use a 12-character hex token (for example, `http://192.168.1.50:8080/4bdaa908ed74`). Beam also accepts query format `/?v=<hash>`.
+- **Range seeking.** Single-range byte requests let browsers scrub through MP4 and WebM videos without downloading the whole file first.
+- **Terminal QR code.** Renders a QR code with Unicode half-blocks so anyone on the same network can scan it from a phone.
+- **Auto expiration.** Sets a default five-hour lifetime, or custom durations using `s`, `m`, `h`, or `d`.
+- **Host override.** Passing `-H host` sets the host, IP, or domain in the link. Useful for Tailscale nodes or custom hostnames.
+- **Clipboard support.** Passing `-c` copies the link to the system clipboard via clipbridge, wl-copy, xclip, pbcopy, or clip.exe.
+- **Piped input.** Accepts file paths or pipeline logs on stdin. When piped from autodub, beam prioritizes the generated dubbed video over subtitle files and logs.
+- **One-shot mode.** Passing `-1` exits immediately after the first complete transfer.
 
 ## Piping from autodub
 
-You can pipe `autodub` directly into `beam`. `beam` prints the progress output as it runs, detects the completed `.mp4` path from the log, starts the server, and prints the URL:
+Pipe autodub into beam. Beam prints the pipeline progress as it runs, picks the dubbed video file when finished, starts the server, and prints the link:
 
 ```sh
-./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
 ```
 
-You can also pipe an existing output file:
+You can also specify a Tailscale node or custom hostname:
 
 ```sh
-ls -t output/*.mp4 | head -1 | beam -p -c
+./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -H myhost.ts.net -c
+```
+
+Or pipe an existing file path:
+
+```sh
+ls -t output/*.mp4 | head -1 | beam -c
 ```
 
 ## Usage
 
 ```sh
-# Share a video locally (5h TTL)
+# Share a video locally (default 5h lifetime)
 beam video.mp4
 
-# Pipe from autodub and open a public HTTPS tunnel
-./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+# Pipe from autodub and copy link to clipboard
+./autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
 
-# Share with a public HTTPS tunnel and copy link to clipboard
-beam -p -c video.mp4
+# Use a specific IP or Tailscale domain for the link
+beam -H 192.168.1.50 -c video.mp4
+beam -H mynode.ts.net -c video.mp4
 
 # Set a custom lifetime
 beam -t 30m video.mp4
@@ -78,11 +86,11 @@ beam -w video.mp4
 | Flag | Description |
 |------|-------------|
 | `-t <ttl>` | Link lifetime. Default is `5h`. Accepts `s`, `m`, `h`, `d`. |
-| `-p` | Open a public HTTPS tunnel through SSH (`localhost.run`). |
+| `-H <host>` | Host or IP for the share link (for example, `192.168.1.50` or `node.ts.net`). |
 | `-c` | Copy the share URL to the system clipboard. |
 | `-q` | Quiet mode. Suppress the terminal QR code. |
 | `-1` | One-shot mode. Exit after the first complete download. |
-| `-w` | Serve an HTML player wrapper instead of raw media stream. |
+| `-w` | Serve an HTML player wrapper instead of the raw media stream. |
 | `-b <ip>` | Bind IP address. Default is `0.0.0.0`. |
 | `-P <port>` | Port to listen on. Default is `8080` or the next available port. |
 | `-v` | Print version and exit. |
