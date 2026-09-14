@@ -478,4 +478,58 @@ else
     echo "[WARN] -p completed or skipped"
 fi
 
+# 21. MP4 faststart flags (-f and -F)
+if command -v ffmpeg >/dev/null 2>&1; then
+    echo "Testing MP4 faststart remuxing (-f)..."
+    VALID_MP4="$TMP_DIR/valid_video.mp4"
+    ffmpeg -y -f lavfi -i testsrc=duration=1:size=160x120:rate=1 -c:v libx264 "$VALID_MP4" >/dev/null 2>&1
+
+    FS_LOG="$TMP_DIR/faststart.log"
+    ./beam -q -f -P 9884 -t 3s "$VALID_MP4" > "$FS_LOG" 2>&1 &
+    FS_PID=$!
+    sleep 0.5
+    FS_TOKEN=$(grep "Link:" "$FS_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
+    if grep -q "serving fast-start MP4" "$FS_LOG"; then
+        FS_RESP=$(curl -s -i "http://127.0.0.1:9884/$FS_TOKEN")
+        if echo "$FS_RESP" | grep -q "video/mp4" && echo "$FS_RESP" | grep -q "HTTP/1.1 200 OK"; then
+            echo "[PASS] -f successfully remuxes MP4 with +faststart and serves it"
+        else
+            echo "[FAIL] -f response failed:\n$FS_RESP"
+            kill $FS_PID 2>/dev/null || true
+            exit 1
+        fi
+    else
+        echo "[FAIL] -f did not log fast-start remux:"
+        cat "$FS_LOG"
+        kill $FS_PID 2>/dev/null || true
+        exit 1
+    fi
+    kill $FS_PID 2>/dev/null || true
+    wait $FS_PID 2>/dev/null || true
+
+    echo "Testing MP4 faststart skip (-F)..."
+    NOFS_LOG="$TMP_DIR/nofaststart.log"
+    ./beam -q -F -P 9885 -t 3s "$VALID_MP4" > "$NOFS_LOG" 2>&1 &
+    NOFS_PID=$!
+    sleep 0.5
+    NOFS_TOKEN=$(grep "Link:" "$NOFS_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
+    if ! grep -q "remuxing MP4" "$NOFS_LOG"; then
+        NOFS_RESP=$(curl -s -i "http://127.0.0.1:9885/$NOFS_TOKEN")
+        if echo "$NOFS_RESP" | grep -q "video/mp4" && echo "$NOFS_RESP" | grep -q "HTTP/1.1 200 OK"; then
+            echo "[PASS] -F correctly skips faststart remuxing"
+        else
+            echo "[FAIL] -F response failed:\n$NOFS_RESP"
+            kill $NOFS_PID 2>/dev/null || true
+            exit 1
+        fi
+    else
+        echo "[FAIL] -F attempted remuxing unexpectedly:"
+        cat "$NOFS_LOG"
+        kill $NOFS_PID 2>/dev/null || true
+        exit 1
+    fi
+    kill $NOFS_PID 2>/dev/null || true
+    wait $NOFS_PID 2>/dev/null || true
+fi
+
 echo "=== All tests passed successfully! ==="

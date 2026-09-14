@@ -1096,6 +1096,7 @@ static bool remux_faststart(BeamConfig *cfg) {
     int fd, st;
     pid_t pid;
     struct stat outst;
+    const char *fmt = (cfg->mimetype && strcmp(cfg->mimetype, "video/quicktime") == 0) ? "mov" : "mp4";
 
     fd = mkstemp(outpath);
     if (fd < 0)
@@ -1115,7 +1116,7 @@ static bool remux_faststart(BeamConfig *cfg) {
             close(devnull);
         }
         execlp("ffmpeg", "ffmpeg", "-nostdin", "-y", "-i", cfg->filepath,
-               "-c", "copy", "-movflags", "+faststart", outpath, (char *)NULL);
+               "-c", "copy", "-movflags", "+faststart", "-f", fmt, outpath, (char *)NULL);
         _exit(127);
     }
     if (waitpid(pid, &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
@@ -1436,6 +1437,10 @@ int main(int argc, char *argv[]) {
     }
 
     cfg.mimetype = beam_mime_type(cfg.filename);
+
+    char saved_filepath[1024];
+    snprintf(saved_filepath, sizeof(saved_filepath), "%s", cfg.filepath);
+
     maybe_faststart(&cfg);
 
     if (!cfg.token[0]) {
@@ -1529,7 +1534,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Save last state for instant reopen */
-    save_last_state(cfg.filepath, cfg.token, share_url);
+    save_last_state(saved_filepath, cfg.token, share_url);
 
     /* Set signal handlers */
     signal(SIGINT, sig_handler);
@@ -1590,7 +1595,7 @@ int main(int argc, char *argv[]) {
                 tunnel_pid = -1;
                 printf("\nbeam: tunnel disconnected, reconnecting...\n");
                 if (open_tunnel(&cfg, share_url, sizeof(share_url))) {
-                    save_last_state(cfg.filepath, cfg.token, share_url);
+                    save_last_state(saved_filepath, cfg.token, share_url);
                     printf("  Link:     \033[4;32m%s\033[0m\n", share_url);
                     if (cfg.copy_clipboard) {
                         copy_to_clipboard(share_url);
@@ -1646,7 +1651,7 @@ int main(int argc, char *argv[]) {
                 if (cmd == 'p' || cmd == 't') {
                     printf("\nbeam: opening tunnel on demand...\n");
                     if (open_tunnel(&cfg, share_url, sizeof(share_url))) {
-                        save_last_state(cfg.filepath, cfg.token, share_url);
+                        save_last_state(saved_filepath, cfg.token, share_url);
                         printf("  Link:     \033[4;32m%s\033[0m\n", share_url);
                         if (copy_to_clipboard(share_url)) {
                             printf("            \033[90m(copied to clipboard)\033[0m\n");
