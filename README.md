@@ -23,9 +23,9 @@ Local-first, fast, and built specifically for sharing dubbed videos, recordings,
 
 ## Features
 
-- **Local-First & Fast**: Zero cloud uploads. Streams directly from your disk using standard OS sockets.
+- **Native Browser Playback**: Opening the link in Chrome, Safari, Firefox, or mobile immediately launches the browser's native video player (scrubbing, volume, fullscreen, and built-in download menu) with zero wrapper bloat.
+- **Embedded HTML5 Web Player (`-w`)**: Optional clean dark-mode web player if a custom HTML frame is preferred.
 - **HTTP 206 Partial Content (Range Requests)**: Built for video streaming. iOS Safari and Android Chrome can seek, scrub, and buffer video containers (`moov` atoms) seamlessly.
-- **Embedded HTML5 Web Player**: Opens directly in mobile or desktop browsers with a dark-mode video player and download button.
 - **Self-Contained ANSI QR Code**: Generates a standard QR code directly in your terminal using Unicode half-blocks (`▀`, `▄`) so phones can scan and watch instantly.
 - **Automatic Expiration**: Configurable TTL (`-t 5h`, `-t 30m`, `-t 1d`). Closes the server and self-terminates when time is up.
 - **Public Tunnel Support (`-p`)**: Built-in zero-install public HTTPS reverse tunnel via SSH (`localhost.run`) for sharing over cellular or outside your local Wi-Fi.
@@ -36,7 +36,7 @@ Local-first, fast, and built specifically for sharing dubbed videos, recordings,
 ## Usage
 
 ```sh
-# Share a video (default 5-hour lifetime, binds to local network)
+# Share a video (streams directly into Chrome/Safari native player, 5h TTL)
 beam video.mp4
 
 # Share over the internet via public HTTPS tunnel + copy link to clipboard
@@ -51,8 +51,8 @@ beam -1 document.pdf
 # Quiet mode (no QR code) on a specific port
 beam -q -P 9000 archive.zip
 
-# Raw file streaming only (bypass HTML5 player)
-beam -r audio.mp3
+# Use HTML5 web player wrapper page
+beam -w video.mp4
 ```
 
 ## Options
@@ -64,7 +64,7 @@ beam -r audio.mp3
 | `-c` | Copy the share URL to system clipboard. |
 | `-q` | Quiet mode: suppress the terminal QR code. |
 | `-1` | One-shot mode: exit after the first complete transfer. |
-| `-r` | Raw stream only (bypass embedded HTML5 player for media files). |
+| `-w` | Enable custom HTML5 web player wrapper page (default: native browser player). |
 | `-b <ip>` | Bind IP address (default `0.0.0.0`). |
 | `-P <port>` | Listening port (default `8080` or next available). |
 | `-v` | Show version and exit. |

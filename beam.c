@@ -380,6 +380,22 @@ static void render_html_player(char *html, size_t maxlen, const BeamConfig *cfg)
              cfg->token, cfg->filename);
 }
 
+static void url_encode_filename(const char *src, char *dst, size_t maxlen) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t d = 0;
+    for (size_t s = 0; src[s] && (d + 4) < maxlen; s++) {
+        unsigned char c = (unsigned char)src[s];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[d++] = (char)c;
+        } else {
+            dst[d++] = '%';
+            dst[d++] = hex[(c >> 4) & 0x0F];
+            dst[d++] = hex[c & 0x0F];
+        }
+    }
+    dst[d] = '\0';
+}
+
 static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_handled) {
     char req_buf[4096];
     int n = recv(client_sock, req_buf, sizeof(req_buf) - 1, 0);
@@ -420,14 +436,10 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
     }
 
     const char *subpath = path + tlen;
-    bool wants_raw = (strcmp(subpath, "/raw") == 0 ||
-                      strcmp(subpath, "/raw/") == 0 ||
-                      (*subpath == '/' && strlen(subpath) > 1 && strcmp(subpath + 1, cfg->filename) == 0) ||
-                      cfg->raw_only ||
-                      !beam_is_media(cfg->mimetype));
 
-    /* If it's a media file and raw not explicitly requested, serve HTML5 player */
-    if (!wants_raw && beam_is_media(cfg->mimetype)) {
+    /* Optional web player wrapper if -w is enabled and requested via /player */
+    if (cfg->web_player && beam_is_media(cfg->mimetype) &&
+        (strcmp(subpath, "/player") == 0 || strcmp(subpath, "/player/") == 0)) {
         char html[8192];
         render_html_player(html, sizeof(html), cfg);
         size_t hlen = strlen(html);
@@ -437,7 +449,7 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
         return;
     }
 
-    /* Open the file for streaming */
+    /* Open the file for direct inline streaming / range playback */
     FILE *fp = fopen(cfg->filepath, "rb");
     if (!fp) {
         send_http_response(client_sock, 500, "Internal Server Error", NULL, "Failed to read file\n", 20);
@@ -516,12 +528,14 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
                         "Content-Type: %s\r\n"
                         "Content-Length: %" PRId64 "\r\n"
                         "Content-Range: bytes %" PRId64 "-%" PRId64 "/%" PRId64 "\r\n"
+                        "Content-Disposition: inline; filename=\"%s\"\r\n"
                         "Accept-Ranges: bytes\r\n"
                         "Connection: keep-alive\r\n\r\n",
                         status_code, status_str,
                         cfg->mimetype,
                         content_length,
-                        range_start, range_end, cfg->filesize);
+                        range_start, range_end, cfg->filesize,
+                        cfg->filename);
     } else {
         hlen = snprintf(headers, sizeof(headers),
                         "HTTP/1.1 %d %s\r\n"
@@ -569,13 +583,13 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-p] [-c] [-q] [-1] [-r] [-b ip] [-P port] <file>\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-p] [-c] [-q] [-1] [-w] [-b ip] [-P port] <file>\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
     fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (localhost.run)\n");
     fprintf(stderr, "  -c        Copy share link to system clipboard\n");
     fprintf(stderr, "  -q        Quiet mode: suppress terminal QR code\n");
     fprintf(stderr, "  -1        One-shot: exit after first complete download/view\n");
-    fprintf(stderr, "  -r        Raw stream only (disable HTML5 video player)\n");
+    fprintf(stderr, "  -w        HTML web player page (default: native browser player)\n");
     fprintf(stderr, "  -b ip     Bind IP address (default: 0.0.0.0)\n");
     fprintf(stderr, "  -P port   Listening port (default: 8080 or next available)\n");
     fprintf(stderr, "  -v        Show version\n");
@@ -606,8 +620,8 @@ int main(int argc, char *argv[]) {
     case '1':
         cfg.max_downloads = 1;
         break;
-    case 'r':
-        cfg.raw_only = true;
+    case 'w':
+        cfg.web_player = true;
         break;
     case 'b':
         snprintf(cfg.bind_ip, sizeof(cfg.bind_ip), "%s", EARGF(usage()));
@@ -703,15 +717,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Resolve sharing URL */
-    char share_url[2048];
+    /* Resolve sharing URL with encoded filename */
+    char share_url[4096];
+    char enc_filename[1024];
+    url_encode_filename(cfg.filename, enc_filename, sizeof(enc_filename));
     bool tunnel_ok = false;
 
 #ifndef _WIN32
     if (cfg.public_tunnel) {
         fprintf(stderr, "beam: establishing public tunnel...\n");
         if (start_ssh_tunnel(cfg.port, cfg.public_url, sizeof(cfg.public_url))) {
-            snprintf(share_url, sizeof(share_url), "%s/s/%s", cfg.public_url, cfg.token);
+            snprintf(share_url, sizeof(share_url), "%s/s/%s/%s", cfg.public_url, cfg.token, enc_filename);
             tunnel_ok = true;
         } else {
             fprintf(stderr, "beam: warning: public tunnel failed, falling back to local network\n");
@@ -722,7 +738,7 @@ int main(int argc, char *argv[]) {
     if (!tunnel_ok) {
         char local_ip[64];
         beam_detect_local_ip(local_ip, sizeof(local_ip));
-        snprintf(share_url, sizeof(share_url), "http://%s:%d/s/%s", local_ip, cfg.port, cfg.token);
+        snprintf(share_url, sizeof(share_url), "http://%s:%d/s/%s/%s", local_ip, cfg.port, cfg.token, enc_filename);
     }
 
     /* Set signal handlers */

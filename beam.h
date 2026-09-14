@@ -25,7 +25,7 @@ typedef struct {
     bool public_tunnel;
     bool copy_clipboard;
     bool no_qr;
-    bool raw_only;
+    bool web_player;
 
     time_t start_time;
     char public_url[1024];
