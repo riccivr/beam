@@ -88,8 +88,8 @@ STREAM_RESP=$(curl -s -i "http://127.0.0.1:$TEST_PORT/$TOKEN")
 if echo "$STREAM_RESP" | grep -q "Content-Type: video/mp4" && \
    echo "$STREAM_RESP" | grep -q "Content-Disposition: inline; filename=\"sample.mp4\"" && \
    echo "$STREAM_RESP" | grep -q "Accept-Ranges: bytes" && \
-   echo "$STREAM_RESP" | grep -q "Connection: close"; then
-    echo "[PASS] Clean path /$TOKEN returns correct stream headers (video/mp4, inline disposition, Connection: close)"
+   echo "$STREAM_RESP" | grep -q "Connection: keep-alive"; then
+    echo "[PASS] Clean path /$TOKEN returns correct stream headers (video/mp4, inline disposition, Connection: keep-alive)"
 else
     echo "[FAIL] Stream headers unexpected:\n$STREAM_RESP"
     kill $BEAM_PID 2>/dev/null || true
@@ -197,6 +197,20 @@ else
     exit 1
 fi
 
+# Keep-alive: two Range GETs on one TCP connection
+KA_CODES=$(curl -s --http1.1 \
+    -o "$TMP_DIR/ka1.bin" -w "%{http_code} " -H "Range: bytes=0-9" "http://127.0.0.1:$TEST_PORT/$TOKEN" \
+    -o "$TMP_DIR/ka2.bin" -w "%{http_code}" -H "Range: bytes=10-19" "http://127.0.0.1:$TEST_PORT/$TOKEN")
+KA_CODES=$(echo "$KA_CODES" | tr -d ' ')
+if [ "$KA_CODES" = "206206" ] && [ "$(wc -c < "$TMP_DIR/ka1.bin" | tr -d ' ')" = "10" ] && \
+   [ "$(wc -c < "$TMP_DIR/ka2.bin" | tr -d ' ')" = "10" ]; then
+    echo "[PASS] Keep-alive reuses connection for two Range requests"
+else
+    echo "[FAIL] Keep-alive dual Range failed: codes='$KA_CODES'"
+    kill $BEAM_PID 2>/dev/null || true
+    exit 1
+fi
+
 # Stop server
 kill $BEAM_PID 2>/dev/null || true
 wait $BEAM_PID 2>/dev/null || true
@@ -289,8 +303,8 @@ else
 fi
 kill $HOST_PID 2>/dev/null || true
 
-# 14. Empty file + Connection: close + 416 on Range
-echo "Testing empty file and Connection: close..."
+# 14. Empty file + Connection: keep-alive + 416 on Range
+echo "Testing empty file and Connection: keep-alive..."
 EMPTY="$TMP_DIR/empty.bin"
 : > "$EMPTY"
 ./beam -q -P 9877 -t 8s "$EMPTY" > "$TMP_DIR/empty.log" 2>&1 &
@@ -300,8 +314,8 @@ EMPTY_TOKEN=$(grep "Link:" "$TMP_DIR/empty.log" | grep -oE '[0-9a-f]{32}' | head
 EMPTY_HDR=$(curl -s -i "http://127.0.0.1:9877/$EMPTY_TOKEN")
 if echo "$EMPTY_HDR" | grep -q "HTTP/1.1 200 OK" && \
    echo "$EMPTY_HDR" | grep -q "Content-Length: 0" && \
-   echo "$EMPTY_HDR" | grep -q "Connection: close"; then
-    echo "[PASS] Empty file returns 200, length 0, Connection: close"
+   echo "$EMPTY_HDR" | grep -q "Connection: keep-alive"; then
+    echo "[PASS] Empty file returns 200, length 0, Connection: keep-alive"
 else
     echo "[FAIL] Empty file headers unexpected:\n$EMPTY_HDR"
     kill $EMPTY_PID 2>/dev/null || true

@@ -3,7 +3,7 @@
 beam \- ephemeral file and video sharing utility
 .SH SYNOPSIS
 .B beam
-.RB [ \-1cpqrvw ]
+.RB [ \-1cfFpqrvw ]
 .RB [ \-t
 .IR ttl ]
 .RB [ \-k
@@ -76,6 +76,12 @@ Quiet mode. Suppress the terminal QR code.
 .TP
 .B \-1
 One-shot mode. Exit after the first complete file download or view.
+.TP
+.B \-f
+Force an MP4 faststart remux with ffmpeg so the index sits at the start of the file.
+.TP
+.B \-F
+Skip MP4 faststart remuxing.
 .TP
 .B \-w
 Serve an HTML player wrapper instead of the raw media stream.

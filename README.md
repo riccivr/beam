@@ -30,6 +30,8 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 - **Direct browser playback.** Beam serves files with `Content-Disposition: inline` and matching MIME types. Browsers open audio and video files in their native media controls.
 - **Clean hash URLs.** Links use a 12-character hex token (for example, `https://5369e9d69bbb03.lhr.life/4bdaa908ed74`). Beam also accepts query format `/?v=<hash>`.
 - **Range seeking.** Single-range byte requests let browsers scrub through MP4 and WebM videos without downloading the whole file first.
+- **Keep-alive + sendfile.** HTTP/1.1 persistent connections and `sendfile()` cut the stalls native players hit when they open many Range requests.
+- **MP4 fast start.** If `ffmpeg` is available, beam remuxes MP4/MOV so the `moov` atom is at the front (`-movflags +faststart`). Use `-F` to skip.
 - **Terminal QR code.** Renders a QR code with Unicode half-blocks so anyone on the same network can scan it from a phone.
 - **Auto expiration.** Sets a default five-hour lifetime, or custom durations using `s`, `m`, `h`, or `d`.
 - **Public tunnel.** Passing `-p` opens an ephemeral HTTPS reverse tunnel via SSH, returning a public link without requiring accounts or logins.
@@ -113,6 +115,8 @@ beam -w video.mp4
 | `-q` | Quiet mode. Suppress the terminal QR code. |
 | `-1` | One-shot mode. Exit after the first complete download. |
 | `-w` | Serve an HTML player wrapper instead of the raw media stream. |
+| `-f` | Force an MP4 faststart remux via ffmpeg before serving. |
+| `-F` | Do not remux; serve the original MP4 as-is. |
 | `-b <ip>` | Bind IP address. Default is `0.0.0.0`. |
 | `-P <port>` | Port to listen on. Default is `8080` or the next available port. |
 | `-v` | Print version and exit. |
