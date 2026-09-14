@@ -856,16 +856,16 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    /* Pretty terminal banner */
+    /* Terminal banner */
     char size_str[32];
     beam_format_size(cfg.filesize, size_str, sizeof(size_str));
 
-    printf("\n  \033[1;36mBEAM\033[0m - Ephemeral File & Video Sharing\n");
+    printf("\n  \033[1;36mbeam\033[0m\n");
     printf("  --------------------------------------------------\n");
-    printf("  \033[1mFile:\033[0m     %s (%s, %s)\n", cfg.filename, size_str, cfg.mimetype);
-    printf("  \033[1mExpires:\033[0m  in %d seconds (%dh %dm)\n",
+    printf("  File:     %s (%s, %s)\n", cfg.filename, size_str, cfg.mimetype);
+    printf("  Expires:  %d seconds (%dh %dm)\n",
            cfg.ttl_seconds, cfg.ttl_seconds / 3600, (cfg.ttl_seconds % 3600) / 60);
-    printf("  \033[1;32mLink:\033[0m     \033[4;32m%s\033[0m\n", share_url);
+    printf("  Link:     \033[4;32m%s\033[0m\n", share_url);
 
     if (cfg.copy_clipboard) {
         if (copy_to_clipboard(share_url)) {
@@ -874,11 +874,11 @@ int main(int argc, char *argv[]) {
     }
 
     if (!cfg.no_qr) {
-        printf("\n  \033[1mScan with camera:\033[0m\n\n");
+        printf("\n  Scan with camera:\n\n");
         qr_print_terminal(stdout, share_url);
     }
 
-    printf("\n  \033[90mServing requests... Press Ctrl+C to terminate early.\033[0m\n\n");
+    printf("\n  Press Ctrl+C to stop.\n\n");
     fflush(stdout);
 
     /* Event Loop */
@@ -887,7 +887,7 @@ int main(int argc, char *argv[]) {
     while (running) {
         time_t now = time(NULL);
         if (now - cfg.start_time >= cfg.ttl_seconds) {
-            printf("\nbeam: link expired after %d seconds. Exiting.\n", cfg.ttl_seconds);
+            printf("\nbeam: link expired after %d seconds\n", cfg.ttl_seconds);
             break;
         }
 
@@ -916,14 +916,14 @@ int main(int argc, char *argv[]) {
                 char time_str[32];
                 strftime(time_str, sizeof(time_str), "%H:%M:%S", tm_info);
 
-                printf("  [%s] Connection from %s\n", time_str, client_ip);
+                printf("  [%s] %s\n", time_str, client_ip);
                 fflush(stdout);
 
                 bool handled = false;
                 handle_client(client_sock, &cfg, &handled);
 
                 if (cfg.max_downloads > 0 && cfg.download_count >= cfg.max_downloads) {
-                    printf("beam: download limit (%d) reached. Exiting.\n", cfg.max_downloads);
+                    printf("beam: download limit reached\n");
                     break;
                 }
             }
@@ -942,6 +942,6 @@ int main(int argc, char *argv[]) {
     WSACleanup();
 #endif
 
-    printf("beam: link closed. Goodbye!\n");
+    printf("beam: link closed\n");
     return 0;
 }

@@ -1,33 +1,36 @@
 .TH BEAM 1 beam\-VERSION
 .SH NAME
-beam \- ephemeral local-first file and video sharing utility
+beam \- ephemeral file and video sharing utility
 .SH SYNOPSIS
 .B beam
-.RB [ \-1cpqrv ]
+.RB [ \-1cpqvw ]
 .RB [ \-t
 .IR ttl ]
 .RB [ \-b
 .IR ip ]
 .RB [ \-P
 .IR port ]
-.RI file
+.RI [ file \ |\  \- ]
 .SH DESCRIPTION
 .B beam
-is a suckless, dependency-free command-line tool that generates a short-lived,
-secure link to share videos and files directly from your machine.
+serves a local file over HTTP using a temporary, random URL.
 .P
-When sharing videos,
+When you share video, browsers open their native media player.
 .B beam
-automatically detects media types and serves an embedded, responsive HTML5
-video player for immediate playback on mobile devices (iOS Safari, Android
-Chrome) or desktop browsers. Full HTTP 206 Partial Content (Range requests)
-is supported for seamless video seeking and scrubbing without requiring
-multi-gigabyte downloads.
+handles HTTP 206 Partial Content range requests so browsers can seek through
+MP4 and WebM files without downloading the entire file first.
 .P
+The URL path contains a random 128-bit hex token.
 .B beam
-generates a 128-bit unguessable random token in the URL path, prints an
-ANSI QR code in the terminal for instant camera scanning, and terminates
-automatically after a configurable lifetime (default 5 hours).
+renders an ANSI QR code in the terminal using Unicode half-blocks and exits
+when the lifetime timer expires (default: 5 hours).
+.P
+If no file argument is given,
+.B beam
+reads standard input. When piped from pipeline tools like
+.BR autodub ,
+it echoes progress output to the terminal in real time and automatically
+extracts the resulting output video path when the upstream process finishes.
 .SH OPTIONS
 .TP
 .BI \-t " ttl"
@@ -41,26 +44,25 @@ are supported. Default is
 .BR 5h .
 .TP
 .B \-p
-Spawn an ephemeral public HTTPS reverse tunnel via SSH (localhost.run) so
-the link can be accessed over the internet outside your local network.
+Open an ephemeral public HTTPS reverse tunnel via SSH through localhost.run.
 .TP
 .B \-c
-Copy the generated share URL to the system clipboard (integrates with
+Copy the share URL to the system clipboard using
 .BR clipbridge ,
 .BR wl-copy ,
 .BR xclip ,
 .BR pbcopy ,
 or
-.BR clip.exe ).
+.BR clip.exe .
 .TP
 .B \-q
-Quiet mode. Suppress the terminal QR code and display only textual details.
+Quiet mode. Suppress the terminal QR code.
 .TP
 .B \-1
-One-shot mode. Exit immediately after the first complete file download or view.
+One-shot mode. Exit after the first complete file download or view.
 .TP
 .B \-w
-Enable HTML web player wrapper page. By default, beam streams directly into the browser's native media player.
+Serve an HTML player wrapper instead of the raw media stream.
 .TP
 .BI \-b " ip"
 Specify the IP address to bind to. Default is
@@ -72,27 +74,27 @@ Specify the port to listen on. Default is
 or the next available port.
 .TP
 .B \-v
-Print version information to standard output and exit.
+Print version information and exit.
 .SH EXAMPLES
-Share a dubbed video with default 5-hour lifetime:
+Share a video locally with default 5-hour lifetime:
 .IP
 .EX
 beam dubbed_video.mp4
 .EE
 .P
-Pipe directly from autodub to share a newly dubbed video automatically:
+Pipe from autodub to share a newly dubbed video over a public tunnel:
 .IP
 .EX
 autodub.sh "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
 .EE
 .P
-Share a video over the internet with public HTTPS tunnel and copy link:
+Share a file over the internet with public HTTPS tunnel and copy link:
 .IP
 .EX
 beam -p -c dubbed_video.mp4
 .EE
 .P
-Share a zip archive valid for 30 minutes in one-shot mode:
+Share an archive valid for 30 minutes in one-shot mode:
 .IP
 .EX
 beam -t 30m -1 archive.zip
