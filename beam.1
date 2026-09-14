@@ -3,9 +3,11 @@
 beam \- ephemeral file and video sharing utility
 .SH SYNOPSIS
 .B beam
-.RB [ \-1cpqvw ]
+.RB [ \-1cpqrvw ]
 .RB [ \-t
 .IR ttl ]
+.RB [ \-k
+.IR token ]
 .RB [ \-H
 .IR host ]
 .RB [ \-b
@@ -23,17 +25,16 @@ handles HTTP 206 Partial Content range requests so browsers can seek through
 MP4 and WebM files without downloading the entire file first.
 .P
 The URL path contains a random 12-character hex token (for example,
-.IR http://192.168.1.50:8080/4bdaa908ed74 ).
+.IR https://5369e9d69bbb03.lhr.life/4bdaa908ed74 ).
 .B beam
 renders an ANSI QR code in the terminal using Unicode half-blocks and exits
 when the lifetime timer expires (default: 5 hours).
 .P
 If no file argument is given,
 .B beam
-reads standard input. When piped from pipeline tools like
-.BR autodub ,
-it echoes progress output to the terminal in real time and automatically
-picks the generated dubbed video over subtitle files and logs.
+automatically reopens the last beamed file and preserves its token so the
+previous link stays live. If piped, it reads standard input and prioritizes
+dubbed video files over subtitles and logs.
 .SH OPTIONS
 .TP
 .BI \-t " ttl"
@@ -48,6 +49,12 @@ are supported. Default is
 .TP
 .B \-p
 Open an ephemeral public HTTPS reverse tunnel via SSH.
+.TP
+.B \-r
+Reopen and resume the last beamed file and token.
+.TP
+.BI \-k " token"
+Specify an explicit 12-character token hash.
 .TP
 .BI \-H " host"
 Specify the host, IP address, or domain name to use in the share link (for example,
@@ -84,6 +91,19 @@ or the next available port.
 .TP
 .B \-v
 Print version information and exit.
+.SH INTERACTIVE COMMANDS
+While
+.B beam
+is running in a terminal, single keystrokes can trigger actions:
+.TP
+.B p
+Open or reopen the public HTTPS tunnel.
+.TP
+.B c
+Copy the share link to the system clipboard.
+.TP
+.B q
+Quit and close the link.
 .SH EXAMPLES
 Share a video locally with default 5-hour lifetime:
 .IP
@@ -95,6 +115,12 @@ Pipe from autodub to share a newly dubbed video publicly:
 .IP
 .EX
 autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+.EE
+.P
+Reopen the last beamed video over the public tunnel with the same link:
+.IP
+.EX
+beam -p -c
 .EE
 .P
 Share a file using a Tailscale hostname:

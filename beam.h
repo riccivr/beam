@@ -27,6 +27,7 @@ typedef struct {
     bool copy_clipboard;
     bool no_qr;
     bool web_player;
+    bool resume_last;
 
     time_t start_time;
     char public_url[1024];

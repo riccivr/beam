@@ -273,14 +273,76 @@ kill $HOST_PID 2>/dev/null || true
 # 14. Ephemeral public tunnel flag (-p) test
 echo "Testing public tunnel flag (-p)..."
 TUNNEL_LOG="$TMP_DIR/tunnel.log"
-if timeout 8 ./beam -q -p -t 2s "$TEST_TXT" > "$TUNNEL_LOG" 2>&1; then
-    if grep -q "https://.*\.lhr\." "$TUNNEL_LOG" && ! grep -q "admin\.localhost\.run" "$TUNNEL_LOG"; then
-        echo "[PASS] -p generated public HTTPS tunnel link without admin login"
+./beam -q -p -t 2s "$TEST_TXT" > "$TUNNEL_LOG" 2>&1 &
+TUN_PID=$!
+for i in $(seq 1 10); do
+    if ! kill -0 $TUN_PID 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+kill -9 $TUN_PID 2>/dev/null || true
+if grep -q "https://.*\.lhr\." "$TUNNEL_LOG" && ! grep -q "admin\.localhost\.run" "$TUNNEL_LOG"; then
+    echo "[PASS] -p generated public HTTPS tunnel link without admin login"
+else
+    echo "[WARN] -p completed or skipped"
+fi
+
+# 15. Reopen last file & token test
+echo "Testing reopen last file & token..."
+REOPEN_SEED_LOG="$TMP_DIR/reopen_seed.log"
+./beam -q -P 9877 -t 2s "$TEST_MP4" > "$REOPEN_SEED_LOG" 2>&1 &
+SEED_PID=$!
+sleep 0.5
+SEED_TOKEN=$(grep "Link:" "$REOPEN_SEED_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
+kill $SEED_PID 2>/dev/null || true
+wait $SEED_PID 2>/dev/null || true
+
+REOPEN_LOG="$TMP_DIR/reopen.log"
+# Invoke beam with no file arguments using -r
+./beam -q -P 9878 -r -t 2s > "$REOPEN_LOG" 2>&1 &
+REOPEN_PID=$!
+sleep 0.5
+REOPEN_TOKEN=$(grep "Link:" "$REOPEN_LOG" | grep -o '[0-9a-f]\{12\}' | head -1)
+if [ -n "$REOPEN_TOKEN" ] && [ "$REOPEN_TOKEN" = "$SEED_TOKEN" ]; then
+    RESP=$(curl -s -i "http://127.0.0.1:9878/$REOPEN_TOKEN")
+    if echo "$RESP" | grep -q "video/mp4" && echo "$RESP" | grep -q "sample.mp4"; then
+        echo "[PASS] Reopened last file with identical token and valid video stream"
     else
-        echo "[WARN] -p did not output expected .lhr domain (possible network delay)"
+        echo "[FAIL] Reopened file response unexpected:\n$RESP"
+        kill $REOPEN_PID 2>/dev/null || true
+        exit 1
     fi
 else
-    echo "[WARN] -p timed out or network unavailable"
+    echo "[FAIL] Reopened token mismatch or failed: seed=$SEED_TOKEN reopen=$REOPEN_TOKEN"
+    cat "$REOPEN_LOG"
+    kill $REOPEN_PID 2>/dev/null || true
+    exit 1
 fi
+kill $REOPEN_PID 2>/dev/null || true
+
+# 16. Custom token flag (-k) test
+echo "Testing custom token flag (-k)..."
+CUSTOM_LOG="$TMP_DIR/custom_token.log"
+CUSTOM_TOK="123456abcdef"
+./beam -q -P 9879 -k "$CUSTOM_TOK" -t 2s "$TEST_TXT" > "$CUSTOM_LOG" 2>&1 &
+CUSTOM_PID=$!
+sleep 0.5
+if grep -q "$CUSTOM_TOK" "$CUSTOM_LOG"; then
+    RESP=$(curl -s -i "http://127.0.0.1:9879/$CUSTOM_TOK")
+    if echo "$RESP" | grep -q "200 OK"; then
+        echo "[PASS] Custom token (-k) correctly accepted and served"
+    else
+        echo "[FAIL] Custom token curl failed:\n$RESP"
+        kill $CUSTOM_PID 2>/dev/null || true
+        exit 1
+    fi
+else
+    echo "[FAIL] Custom token not found in output:"
+    cat "$CUSTOM_LOG"
+    kill $CUSTOM_PID 2>/dev/null || true
+    exit 1
+fi
+kill $CUSTOM_PID 2>/dev/null || true
 
 echo "=== All tests passed successfully! ==="

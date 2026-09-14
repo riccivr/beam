@@ -43,6 +43,7 @@
   #include <net/if.h>
   #include <poll.h>
   #include <sys/wait.h>
+  #include <termios.h>
   #define close_socket(s) close(s)
   typedef int SOCKET;
   #define INVALID_SOCKET (-1)
@@ -56,6 +57,33 @@ char *argv0;
 static volatile sig_atomic_t running = 1;
 static pid_t tunnel_pid = -1;
 static char global_temp_file[1024] = "";
+
+#ifndef _WIN32
+static struct termios orig_termios;
+static bool termios_set = false;
+
+static void restore_terminal(void) {
+    if (termios_set) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+        termios_set = false;
+    }
+}
+
+static void enable_raw_terminal(int fd) {
+    if (fd >= 0 && isatty(fd)) {
+        if (tcgetattr(fd, &orig_termios) == 0) {
+            struct termios raw = orig_termios;
+            raw.c_lflag &= ~(ICANON | ECHO);
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 0;
+            if (tcsetattr(fd, TCSANOW, &raw) == 0) {
+                termios_set = true;
+                atexit(restore_terminal);
+            }
+        }
+    }
+}
+#endif
 
 static void cleanup_temp_file(void) {
     if (global_temp_file[0]) {
@@ -84,6 +112,114 @@ static const char *ci_strstr(const char *haystack, const char *needle) {
         }
     }
     return NULL;
+}
+
+static void get_cache_dir(char *buf, size_t maxlen) {
+    const char *home = getenv("HOME");
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && *xdg) {
+        snprintf(buf, maxlen, "%s/beam", xdg);
+    } else if (home && *home) {
+        snprintf(buf, maxlen, "%s/.cache/beam", home);
+    } else {
+        snprintf(buf, maxlen, "/tmp/beam_cache");
+    }
+}
+
+static void ensure_dir(const char *path) {
+    char temp[1024];
+    snprintf(temp, sizeof(temp), "%s", path);
+    for (char *p = temp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+#ifdef _WIN32
+            CreateDirectoryA(temp, NULL);
+#else
+            mkdir(temp, 0700);
+#endif
+            *p = '/';
+        }
+    }
+#ifdef _WIN32
+    CreateDirectoryA(temp, NULL);
+#else
+    mkdir(temp, 0700);
+#endif
+}
+
+static void save_last_state(const char *filepath, const char *token, const char *url) {
+    char dir[512];
+    get_cache_dir(dir, sizeof(dir));
+    ensure_dir(dir);
+
+    char path_file[1024];
+    snprintf(path_file, sizeof(path_file), "%s/last_file", dir);
+    FILE *fp = fopen(path_file, "w");
+    if (fp) {
+        fputs(filepath, fp);
+        fclose(fp);
+    }
+
+    if (token && *token) {
+        char tok_file[1024];
+        snprintf(tok_file, sizeof(tok_file), "%s/last_token", dir);
+        fp = fopen(tok_file, "w");
+        if (fp) {
+            fputs(token, fp);
+            fclose(fp);
+        }
+    }
+
+    if (url && *url) {
+        char url_file[1024];
+        snprintf(url_file, sizeof(url_file), "%s/last_url", dir);
+        fp = fopen(url_file, "w");
+        if (fp) {
+            fputs(url, fp);
+            fclose(fp);
+        }
+    }
+}
+
+static bool load_last_state(char *filepath, size_t file_len, char *token, size_t tok_len) {
+    char dir[512];
+    get_cache_dir(dir, sizeof(dir));
+
+    char path_file[1024];
+    snprintf(path_file, sizeof(path_file), "%s/last_file", dir);
+    FILE *fp = fopen(path_file, "r");
+    if (!fp) return false;
+
+    if (!fgets(filepath, (int)file_len, fp)) {
+        fclose(fp);
+        return false;
+    }
+    fclose(fp);
+
+    /* Strip trailing newline */
+    char *nl = strpbrk(filepath, "\r\n");
+    if (nl) *nl = '\0';
+
+    /* Verify file still exists on disk */
+    struct stat st;
+    if (stat(filepath, &st) != 0 || S_ISDIR(st.st_mode)) {
+        return false;
+    }
+
+    if (token && tok_len > 0) {
+        char tok_file[1024];
+        snprintf(tok_file, sizeof(tok_file), "%s/last_token", dir);
+        fp = fopen(tok_file, "r");
+        if (fp) {
+            if (fgets(token, (int)tok_len, fp)) {
+                nl = strpbrk(token, "\r\n");
+                if (nl) *nl = '\0';
+            }
+            fclose(fp);
+        }
+    }
+
+    return true;
 }
 
 const char *beam_mime_type(const char *path) {
@@ -277,6 +413,19 @@ static bool copy_to_clipboard(const char *text) {
     return false;
 }
 
+static void cleanup_tunnel(void) {
+#ifndef _WIN32
+    if (tunnel_pid > 0) {
+        kill(-tunnel_pid, SIGTERM);
+        kill(-tunnel_pid, SIGKILL);
+        kill(tunnel_pid, SIGTERM);
+        kill(tunnel_pid, SIGKILL);
+        waitpid(tunnel_pid, NULL, 0);
+        tunnel_pid = -1;
+    }
+#endif
+}
+
 #ifndef _WIN32
 static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen) {
     int pipefd[2];
@@ -290,6 +439,15 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
     }
 
     if (pid == 0) {
+        /* Set new process group so child can be killed cleanly */
+        setpgid(0, 0);
+
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            close(devnull);
+        }
+
         /* Child: redirect stdout & stderr to pipe */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
@@ -319,7 +477,20 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
     size_t line_len = 0;
     time_t t_start = time(NULL);
 
-    while (time(NULL) - t_start < 12) {
+    while (time(NULL) - t_start < 10) {
+        struct pollfd pfd;
+        pfd.fd = pipefd[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pret = poll(&pfd, 1, 500);
+        if (pret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pret == 0) {
+            continue; /* Timeout, check loop elapsed time */
+        }
+
         char ch;
         ssize_t n = read(pipefd[0], &ch, 1);
         if (n <= 0) break;
@@ -351,6 +522,23 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
     return false;
 }
 #endif
+
+static bool open_tunnel(BeamConfig *cfg, char *share_url, size_t maxlen) {
+#ifndef _WIN32
+    cleanup_tunnel();
+    fprintf(stderr, "beam: establishing public tunnel...\n");
+    if (start_ssh_tunnel(cfg->port, cfg->public_url, sizeof(cfg->public_url))) {
+        snprintf(share_url, maxlen, "%s/%s", cfg->public_url, cfg->token);
+        cfg->public_tunnel = true;
+        return true;
+    } else {
+        fprintf(stderr, "beam: warning: public tunnel failed\n");
+    }
+#else
+    (void)cfg; (void)share_url; (void)maxlen;
+#endif
+    return false;
+}
 
 static void send_http_response(SOCKET sock, int status, const char *status_text,
                                const char *extra_headers, const char *body, size_t body_len) {
@@ -646,9 +834,11 @@ static void handle_client(SOCKET client_sock, BeamConfig *cfg, bool *request_han
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-p] [-H host] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-p] [-r] [-k token] [-H host] [-c] [-q] [-1] [-w] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
     fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (for remote sharing)\n");
+    fprintf(stderr, "  -r        Reopen/resume last beamed file and link\n");
+    fprintf(stderr, "  -k token  Use explicit token hash (12 hex characters)\n");
     fprintf(stderr, "  -H host   Host or IP for share link (e.g. 192.168.1.50, mynode.ts.net)\n");
     fprintf(stderr, "  -c        Copy share link to system clipboard\n");
     fprintf(stderr, "  -q        Quiet mode: suppress terminal QR code\n");
@@ -658,7 +848,8 @@ static void usage(void) {
     fprintf(stderr, "  -P port   Listening port (default: 8080 or next available)\n");
     fprintf(stderr, "  -v        Show version\n");
     fprintf(stderr, "\nNotes:\n");
-    fprintf(stderr, "  If no file is specified, beam reads from standard input.\n");
+    fprintf(stderr, "  If no file is specified, beam reopens the last beamed file, or reads stdin.\n");
+    fprintf(stderr, "  While running, press [p] to reopen tunnel, [c] to copy link, [q] to exit.\n");
     fprintf(stderr, "  Piping from autodub echoes progress and shares the dubbed video:\n");
     fprintf(stderr, "    autodub \"https://www.youtube.com/watch?v=...\" | beam -p -c\n");
     exit(1);
@@ -760,6 +951,12 @@ int main(int argc, char *argv[]) {
     case 'p':
         cfg.public_tunnel = true;
         break;
+    case 'r':
+        cfg.resume_last = true;
+        break;
+    case 'k':
+        snprintf(cfg.token, sizeof(cfg.token), "%s", EARGF(usage()));
+        break;
     case 'H':
         snprintf(cfg.host, sizeof(cfg.host), "%s", EARGF(usage()));
         break;
@@ -789,16 +986,14 @@ int main(int argc, char *argv[]) {
     } ARGEND;
 
     atexit(cleanup_temp_file);
+#ifndef _WIN32
+    atexit(cleanup_tunnel);
+#endif
 
     bool is_temp_file = false;
 
-    if (argc < 1 || strcmp(argv[0], "-") == 0) {
-#ifndef _WIN32
-        if (argc < 1 && isatty(STDIN_FILENO)) {
-            usage();
-        }
-#endif
-        if (argc >= 1 && strcmp(argv[0], "-") == 0) {
+    if (cfg.resume_last || argc < 1 || strcmp(argv[0], "-") == 0) {
+        if (!cfg.resume_last && argc >= 1 && strcmp(argv[0], "-") == 0) {
             /* Raw stdin stream: write to a temporary file */
             char tmppath[] = "/tmp/beam_stream_XXXXXX";
             int fd = mkstemp(tmppath);
@@ -820,6 +1015,19 @@ int main(int argc, char *argv[]) {
             snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", tmppath);
             snprintf(global_temp_file, sizeof(global_temp_file), "%s", tmppath);
             is_temp_file = true;
+        } else if (cfg.resume_last || isatty(STDIN_FILENO)) {
+            /* No file given or explicit -r: check for last beamed file */
+            char last_file[1024] = "";
+            char last_tok[64] = "";
+            if (load_last_state(last_file, sizeof(last_file), last_tok, sizeof(last_tok))) {
+                snprintf(cfg.filepath, sizeof(cfg.filepath), "%s", last_file);
+                if (!cfg.token[0] && last_tok[0]) {
+                    snprintf(cfg.token, sizeof(cfg.token), "%.12s", last_tok);
+                }
+                fprintf(stderr, "beam: reopening last file: %s\n", cfg.filepath);
+            } else {
+                usage();
+            }
         } else {
             /* Piped input from tools like autodub, find, ls, echo, etc. */
             char line[4096];
@@ -888,7 +1096,10 @@ int main(int argc, char *argv[]) {
     }
 
     cfg.mimetype = beam_mime_type(cfg.filename);
-    beam_generate_token(cfg.token, sizeof(cfg.token));
+
+    if (!cfg.token[0]) {
+        beam_generate_token(cfg.token, sizeof(cfg.token));
+    }
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -938,20 +1149,15 @@ int main(int argc, char *argv[]) {
     }
 
     /* Build sharing URL */
-    char share_url[2048];
+    char share_url[2048] = "";
     bool tunnel_ok = false;
 
-#ifndef _WIN32
     if (cfg.public_tunnel) {
-        fprintf(stderr, "beam: establishing public tunnel...\n");
-        if (start_ssh_tunnel(cfg.port, cfg.public_url, sizeof(cfg.public_url))) {
-            snprintf(share_url, sizeof(share_url), "%s/%s", cfg.public_url, cfg.token);
-            tunnel_ok = true;
-        } else {
+        tunnel_ok = open_tunnel(&cfg, share_url, sizeof(share_url));
+        if (!tunnel_ok) {
             fprintf(stderr, "beam: warning: public tunnel failed, falling back to local network\n");
         }
     }
-#endif
 
     if (!tunnel_ok) {
         char host_str[256];
@@ -977,6 +1183,9 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+
+    /* Save last state for instant reopen */
+    save_last_state(cfg.filepath, cfg.token, share_url);
 
     /* Set signal handlers */
     signal(SIGINT, sig_handler);
@@ -1007,8 +1216,15 @@ int main(int argc, char *argv[]) {
         qr_print_terminal(stdout, share_url);
     }
 
-    printf("\n  Press Ctrl+C to stop.\n\n");
+    printf("\n  Commands: [p] reopen tunnel  [c] copy link  [q] quit\n\n");
     fflush(stdout);
+
+#ifndef _WIN32
+    int tty_fd = open("/dev/tty", O_RDONLY | O_NONBLOCK);
+    if (tty_fd >= 0) {
+        enable_raw_terminal(tty_fd);
+    }
+#endif
 
     /* Event Loop */
     cfg.start_time = time(NULL);
@@ -1020,18 +1236,81 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        struct pollfd pfd;
-        pfd.fd = server_sock;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
+#ifndef _WIN32
+        /* Auto-reconnect tunnel if SSH child exited unexpectedly */
+        if (cfg.public_tunnel && tunnel_pid > 0) {
+            int status = 0;
+            pid_t wp = waitpid(tunnel_pid, &status, WNOHANG);
+            if (wp == tunnel_pid || (wp == -1 && errno != ECHILD)) {
+                tunnel_pid = -1;
+                printf("\nbeam: tunnel disconnected, reconnecting...\n");
+                if (open_tunnel(&cfg, share_url, sizeof(share_url))) {
+                    save_last_state(cfg.filepath, cfg.token, share_url);
+                    printf("  Link:     \033[4;32m%s\033[0m\n", share_url);
+                    if (cfg.copy_clipboard) {
+                        copy_to_clipboard(share_url);
+                    }
+                    fflush(stdout);
+                }
+            }
+        }
+#endif
 
-        int ret = poll(&pfd, 1, 1000); /* 1s timeout to check TTL */
+        struct pollfd pfds[2];
+        pfds[0].fd = server_sock;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        int nfds = 1;
+
+#ifndef _WIN32
+        if (tty_fd >= 0) {
+            pfds[1].fd = tty_fd;
+            pfds[1].events = POLLIN;
+            pfds[1].revents = 0;
+            nfds = 2;
+        }
+#endif
+
+        int ret = poll(pfds, (nfds_t)nfds, 1000); /* 1s timeout to check TTL */
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        if (ret > 0 && (pfd.revents & POLLIN)) {
+#ifndef _WIN32
+        /* Check keyboard command input */
+        if (tty_fd >= 0 && (pfds[1].revents & POLLIN)) {
+            char cmd = 0;
+            if (read(tty_fd, &cmd, 1) == 1) {
+                if (cmd == 'p' || cmd == 't') {
+                    printf("\nbeam: opening tunnel on demand...\n");
+                    if (open_tunnel(&cfg, share_url, sizeof(share_url))) {
+                        save_last_state(cfg.filepath, cfg.token, share_url);
+                        printf("  Link:     \033[4;32m%s\033[0m\n", share_url);
+                        if (copy_to_clipboard(share_url)) {
+                            printf("            \033[90m(copied to clipboard)\033[0m\n");
+                        }
+                        if (!cfg.no_qr) {
+                            printf("\n  Scan with camera:\n\n");
+                            qr_print_terminal(stdout, share_url);
+                        }
+                        printf("\n  Commands: [p] reopen tunnel  [c] copy link  [q] quit\n\n");
+                        fflush(stdout);
+                    }
+                } else if (cmd == 'c') {
+                    if (copy_to_clipboard(share_url)) {
+                        printf("\n  \033[90m(link copied to clipboard)\033[0m\n");
+                        fflush(stdout);
+                    }
+                } else if (cmd == 'q' || cmd == 'x') {
+                    running = 0;
+                    break;
+                }
+            }
+        }
+#endif
+
+        if (ret > 0 && (pfds[0].revents & POLLIN)) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
             SOCKET client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_len);
@@ -1060,13 +1339,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* Cleanup */
+#ifndef _WIN32
+    if (tty_fd >= 0) {
+        restore_terminal();
+        close(tty_fd);
+    }
+#endif
+
     close_socket(server_sock);
 
 #ifndef _WIN32
-    if (tunnel_pid > 0) {
-        kill(tunnel_pid, SIGTERM);
-        waitpid(tunnel_pid, NULL, WNOHANG);
-    }
+    cleanup_tunnel();
 #else
     WSACleanup();
 #endif
