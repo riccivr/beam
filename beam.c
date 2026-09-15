@@ -74,6 +74,7 @@ static long monotonic_ms(void) {
 char *argv0;
 static volatile sig_atomic_t running = 1;
 static pid_t tunnel_pid = -1;
+static int tunnel_log_fd = -1;
 static char global_temp_file[1024] = "";
 static char global_faststart_file[1024] = "";
 
@@ -543,6 +544,10 @@ static bool copy_to_clipboard(const char *text) {
 
 static void cleanup_tunnel(void) {
 #ifndef _WIN32
+    if (tunnel_log_fd >= 0) {
+        close(tunnel_log_fd);
+        tunnel_log_fd = -1;
+    }
     if (tunnel_pid > 0) {
         kill(-tunnel_pid, SIGTERM);
         kill(-tunnel_pid, SIGKILL);
@@ -550,6 +555,22 @@ static void cleanup_tunnel(void) {
         kill(tunnel_pid, SIGKILL);
         waitpid(tunnel_pid, NULL, 0);
         tunnel_pid = -1;
+    }
+#endif
+}
+
+static void drain_tunnel_logs(void) {
+#ifndef _WIN32
+    char junk[4096];
+    if (tunnel_log_fd < 0)
+        return;
+    for (;;) {
+        ssize_t n = read(tunnel_log_fd, junk, sizeof(junk));
+        if (n > 0)
+            continue;
+        if (n < 0 && errno == EINTR)
+            continue;
+        break;
     }
 #endif
 }
@@ -569,6 +590,9 @@ static bool extract_cf_url(char *line, char *public_url_out, size_t maxlen) {
             char saved = *end;
             *end = '\0';
             if (strstr(found, ".trycloudflare.com")) {
+                size_t n = strlen(found);
+                while (n > 0 && found[n - 1] == '/')
+                    found[--n] = '\0';
                 snprintf(public_url_out, maxlen, "%s", found);
                 *end = saved;
                 return true;
@@ -649,7 +673,15 @@ static bool start_http_tunnel(int local_port, char *public_url_out, size_t maxle
         if (ch == '\n' || ch == '\r') {
             line[line_len] = '\0';
             if (extract_cf_url(line, public_url_out, maxlen)) {
-                close(pipefd[0]);
+                /* Keep the read end open and drain it later. Closing it
+                 * sends SIGPIPE the next time cloudflared logs, which
+                 * kills the tunnel and invalidates the URL. */
+                int flags = fcntl(pipefd[0], F_GETFL, 0);
+                if (flags >= 0)
+                    fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+                tunnel_log_fd = pipefd[0];
+                /* Edge hostname is printed before the route is always ready. */
+                sleep(1);
                 return true;
             }
             line_len = 0;
@@ -1678,11 +1710,16 @@ int main(int argc, char *argv[]) {
 
 #ifndef _WIN32
         /* Auto-reconnect tunnel if cloudflared child exited unexpectedly */
+        drain_tunnel_logs();
         if (cfg.public_tunnel && tunnel_pid > 0) {
             int status = 0;
             pid_t wp = waitpid(tunnel_pid, &status, WNOHANG);
-            if (wp == tunnel_pid || (wp == -1 && errno != ECHILD)) {
+            if (wp == tunnel_pid || (wp == -1 && errno == ECHILD)) {
                 tunnel_pid = -1;
+                if (tunnel_log_fd >= 0) {
+                    close(tunnel_log_fd);
+                    tunnel_log_fd = -1;
+                }
                 printf("\nbeam: tunnel disconnected, reconnecting...\n");
                 if (open_tunnel(&cfg, share_url, sizeof(share_url))) {
                     save_last_state(saved_filepath, cfg.token, share_url);
@@ -1700,8 +1737,10 @@ int main(int argc, char *argv[]) {
             int st;
             pid_t w;
             while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
-                if (w == tunnel_pid)
+                if (w == tunnel_pid) {
+                    tunnel_pid = -1;
                     continue;
+                }
                 if (workers > 0)
                     workers--;
                 if (WIFEXITED(st) && WEXITSTATUS(st) == WORKER_EXIT_FULL)
@@ -1823,8 +1862,10 @@ int main(int argc, char *argv[]) {
             int st;
             pid_t w;
             while ((w = waitpid(-1, &st, WNOHANG)) > 0) {
-                if (w == tunnel_pid)
+                if (w == tunnel_pid) {
+                    tunnel_pid = -1;
                     continue;
+                }
                 if (workers > 0)
                     workers--;
                 if (WIFEXITED(st) && WEXITSTATUS(st) == WORKER_EXIT_FULL)
