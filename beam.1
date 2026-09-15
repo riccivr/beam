@@ -30,8 +30,9 @@ The URL path contains a random 32-character hex token from /dev/urandom
 .P
 The
 .B \-p
-tunnel disables SSH compression and uses larger TCP buffers so native
-players can keep Range requests on one connection across the hop.
+option starts a Cloudflare quick tunnel
+.RB ( cloudflared )
+so remote players hit HTTPS at the edge instead of an SSH forward.
 .B beam
 renders an ANSI QR code in the terminal using Unicode half-blocks and exits
 when the lifetime timer expires (default: 5 hours).
@@ -54,7 +55,10 @@ are supported. Default is
 .BR 5h .
 .TP
 .B \-p
-Open an ephemeral public HTTPS reverse tunnel via SSH.
+Open an ephemeral public HTTPS tunnel via cloudflared. Requires
+.B cloudflared
+on PATH. Override the binary with
+.BR BEAM_TUNNEL_BIN .
 .TP
 .B \-r
 Reopen and resume the last beamed file and token.

@@ -488,8 +488,10 @@ for i in $(seq 1 10); do
     sleep 0.5
 done
 kill -9 $TUN_PID 2>/dev/null || true
-if grep -q "https://.*\.lhr\." "$TUNNEL_LOG" && ! grep -q "admin\.localhost\.run" "$TUNNEL_LOG"; then
-    echo "[PASS] -p generated public HTTPS tunnel link without admin login"
+if grep -q "https://.*\.trycloudflare\.com" "$TUNNEL_LOG"; then
+    echo "[PASS] -p generated Cloudflare quick-tunnel HTTPS link"
+elif grep -q "public tunnel failed" "$TUNNEL_LOG"; then
+    echo "[WARN] -p skipped (cloudflared missing or tunnel unreachable)"
 else
     echo "[WARN] -p completed or skipped"
 fi

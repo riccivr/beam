@@ -29,16 +29,16 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 
 - **Direct browser playback.** Beam serves files with `Content-Disposition: inline` and matching MIME types. Browsers open audio and video files in their native media controls.
 - **Clean hash URLs.** Links use a 32-character hex token from `/dev/urandom` (128 bits). Beam also accepts query format `/?v=<hash>`.
-- **Public-tunnel playback.** `-p` SSH forwarding disables compression (video is already compressed), raises socket buffers, and assembles full HTTP requests so Range seeks survive tunnel latency.
+- **Public-tunnel playback.** `-p` starts a Cloudflare quick tunnel (`cloudflared`). The browser uses HTTPS to the edge; beam still serves Range requests on localhost.
 - **Range seeking.** Single-range byte requests let browsers scrub through MP4 and WebM videos without downloading the whole file first.
 - **Keep-alive + sendfile.** HTTP/1.1 persistent connections and `sendfile()` cut the stalls native players hit when they open many Range requests.
 - **MP4 fast start.** If `ffmpeg` is available, beam remuxes MP4/MOV so the `moov` atom is at the front (`-movflags +faststart`). Use `-F` to skip.
 - **Terminal QR code.** Renders a QR code with Unicode half-blocks so anyone on the same network can scan it from a phone.
 - **Auto expiration.** Sets a default five-hour lifetime, or custom durations using `s`, `m`, `h`, or `d`.
-- **Public tunnel.** Passing `-p` opens an ephemeral HTTPS reverse tunnel via SSH, returning a public link without requiring accounts or logins.
+- **Public tunnel.** Passing `-p` opens an ephemeral HTTPS tunnel with `cloudflared` (no account). Requires the `cloudflared` binary on PATH, or `BEAM_TUNNEL_BIN`.
 - **Reopen anytime.** Running `beam -p -c` (or `beam -r`) without arguments reopens the last beamed file and keeps the same token so the link stays active.
 - **Live controls.** While beam is running, press `[p]` to reopen or start the tunnel, `[c]` to copy the link, and `[q]` to quit.
-- **Auto reconnect.** If the SSH tunnel drops, beam automatically re-establishes the tunnel and prints the new link.
+- **Auto reconnect.** If the tunnel process drops, beam starts a new one and prints the new link.
 - **Host override.** Passing `-H host` sets the host, IP, or domain in the link. Useful for Tailscale nodes or custom hostnames.
 - **Clipboard support.** Passing `-c` copies the link to the system clipboard via clipbridge, wl-copy, xclip, pbcopy, or clip.exe.
 - **Piped input.** Accepts file paths or pipeline logs on stdin. When piped from autodub, beam prioritizes the generated dubbed video over subtitle files and logs.
@@ -108,7 +108,7 @@ beam -w video.mp4
 | Flag | Description |
 |------|-------------|
 | `-t <ttl>` | Link lifetime. Default is `5h`. Accepts `s`, `m`, `h`, `d`. |
-| `-p` | Open an ephemeral public HTTPS reverse tunnel via SSH. |
+| `-p` | Open an ephemeral public HTTPS tunnel via `cloudflared`. |
 | `-r` | Reopen and resume the last beamed file with its existing token. |
 | `-k <token>` | Use an explicit 12-character token hash. |
 | `-H <host>` | Host or IP for the share link (for example, `192.168.1.50` or `node.ts.net`). |

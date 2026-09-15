@@ -555,8 +555,42 @@ static void cleanup_tunnel(void) {
 }
 
 #ifndef _WIN32
-static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen) {
+static bool extract_cf_url(char *line, char *public_url_out, size_t maxlen) {
+    char *found = strstr(line, "https://");
+    while (found) {
+        char *end = found;
+        while (*end && !isspace((unsigned char)*end) && *end != '"' && *end != '\'' && *end != ',')
+            end++;
+        if ((size_t)(end - found) < 12) {
+            found = strstr(found + 8, "https://");
+            continue;
+        }
+        {
+            char saved = *end;
+            *end = '\0';
+            if (strstr(found, ".trycloudflare.com")) {
+                snprintf(public_url_out, maxlen, "%s", found);
+                *end = saved;
+                return true;
+            }
+            *end = saved;
+        }
+        found = strstr(found + 8, "https://");
+    }
+    return false;
+}
+
+static bool start_http_tunnel(int local_port, char *public_url_out, size_t maxlen) {
     int pipefd[2];
+    char origin[64];
+    const char *bin;
+
+    if (access("/usr/bin/cloudflared", X_OK) != 0 &&
+        access("/usr/local/bin/cloudflared", X_OK) != 0 &&
+        access("/opt/homebrew/bin/cloudflared", X_OK) != 0) {
+        /* still try PATH via execlp */
+    }
+
     if (pipe(pipefd) == -1) return false;
 
     pid_t pid = fork();
@@ -567,7 +601,6 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
     }
 
     if (pid == 0) {
-        /* Set new process group so child can be killed cleanly */
         setpgid(0, 0);
 
         int devnull = open("/dev/null", O_RDONLY);
@@ -576,41 +609,27 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
             close(devnull);
         }
 
-        /* Child: redirect stdout & stderr to pipe */
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
 
-        char port_spec[64];
-        snprintf(port_spec, sizeof(port_spec), "80:localhost:%d", local_port);
-
-        execlp("ssh", "ssh",
-               "-T",
-               "-o", "StrictHostKeyChecking=no",
-               "-o", "UserKnownHostsFile=/dev/null",
-               "-o", "ExitOnForwardFailure=yes",
-               "-o", "Compression=no",
-               "-o", "IPQoS=throughput",
-               "-o", "TCPKeepAlive=yes",
-               "-o", "ServerAliveInterval=15",
-               "-o", "ServerAliveCountMax=4",
-               "-R", port_spec,
-               "nokey@localhost.run",
-               (char *)NULL);
-        _exit(1);
+        snprintf(origin, sizeof(origin), "http://127.0.0.1:%d", local_port);
+        bin = getenv("BEAM_TUNNEL_BIN");
+        if (!bin || !bin[0])
+            bin = "cloudflared";
+        execlp(bin, bin, "tunnel", "--url", origin, "--no-autoupdate", (char *)NULL);
+        _exit(127);
     }
 
-    /* Parent */
     close(pipefd[1]);
     tunnel_pid = pid;
 
-    /* Read child output until we find the actual tunnel URL, ignoring admin/login links */
     char line[2048];
     size_t line_len = 0;
     time_t t_start = time(NULL);
 
-    while (time(NULL) - t_start < 10) {
+    while (time(NULL) - t_start < 25) {
         struct pollfd pfd;
         pfd.fd = pipefd[0];
         pfd.events = POLLIN;
@@ -620,9 +639,8 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
             if (errno == EINTR) continue;
             break;
         }
-        if (pret == 0) {
-            continue; /* Timeout, check loop elapsed time */
-        }
+        if (pret == 0)
+            continue;
 
         char ch;
         ssize_t n = read(pipefd[0], &ch, 1);
@@ -630,20 +648,9 @@ static bool start_ssh_tunnel(int local_port, char *public_url_out, size_t maxlen
 
         if (ch == '\n' || ch == '\r') {
             line[line_len] = '\0';
-
-            /* Skip administrative domains that require account registration / email login */
-            if (!strstr(line, "admin.localhost.run") && !strstr(line, "localhost.run/docs")) {
-                char *tun = strstr(line, "tunneled with tls termination");
-                char *found = tun ? strstr(tun, "https://") : strstr(line, "https://");
-
-                if (found && (strstr(found, ".lhr.life") || strstr(found, ".lhr.pro") || strstr(found, ".localhost.run"))) {
-                    char *end = found;
-                    while (*end && !isspace((unsigned char)*end) && *end != ',') end++;
-                    *end = '\0';
-                    snprintf(public_url_out, maxlen, "%s", found);
-                    close(pipefd[0]);
-                    return true;
-                }
+            if (extract_cf_url(line, public_url_out, maxlen)) {
+                close(pipefd[0]);
+                return true;
             }
             line_len = 0;
         } else if (line_len + 1 < sizeof(line)) {
@@ -660,12 +667,12 @@ static bool open_tunnel(BeamConfig *cfg, char *share_url, size_t maxlen) {
 #ifndef _WIN32
     cleanup_tunnel();
     fprintf(stderr, "beam: establishing public tunnel...\n");
-    if (start_ssh_tunnel(cfg->port, cfg->public_url, sizeof(cfg->public_url))) {
+    if (start_http_tunnel(cfg->port, cfg->public_url, sizeof(cfg->public_url))) {
         snprintf(share_url, maxlen, "%s/%s", cfg->public_url, cfg->token);
         cfg->public_tunnel = true;
         return true;
     } else {
-        fprintf(stderr, "beam: warning: public tunnel failed\n");
+        fprintf(stderr, "beam: warning: public tunnel failed (install cloudflared)\n");
     }
 #else
     (void)cfg; (void)share_url; (void)maxlen;
@@ -1248,7 +1255,7 @@ static bool maybe_faststart(BeamConfig *cfg) {
 static void usage(void) {
     fprintf(stderr, "usage: %s [-t ttl] [-p] [-r] [-k token] [-H host] [-c] [-q] [-1] [-w] [-f] [-F] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
-    fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via SSH (for remote sharing)\n");
+    fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via cloudflared (for remote sharing)\n");
     fprintf(stderr, "  -r        Reopen/resume last beamed file and link\n");
     fprintf(stderr, "  -k token  Use explicit token hash (32 hex characters)\n");
     fprintf(stderr, "  -H host   Host or IP for share link (e.g. 192.168.1.50, mynode.ts.net)\n");
@@ -1670,7 +1677,7 @@ int main(int argc, char *argv[]) {
         }
 
 #ifndef _WIN32
-        /* Auto-reconnect tunnel if SSH child exited unexpectedly */
+        /* Auto-reconnect tunnel if cloudflared child exited unexpectedly */
         if (cfg.public_tunnel && tunnel_pid > 0) {
             int status = 0;
             pid_t wp = waitpid(tunnel_pid, &status, WNOHANG);
