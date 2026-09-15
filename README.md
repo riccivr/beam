@@ -11,7 +11,7 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
   --------------------------------------------------
   File:     dubbed_video.mp4 (42.5 MB, video/mp4)
   Expires:  18000 seconds (5h 0m)
-  Link:     https://5369e9d69bbb03.lhr.life/4bdaa908ed74
+  Link:     https://meetings-recorder-approved-bernard.trycloudflare.com/bbd76c292d2d3b447bd9775f07bf3d47
             (copied to clipboard)
 
   Scan with camera:
@@ -84,7 +84,7 @@ beam -p -c
 beam -r
 
 # Use a specific token hash
-beam -k 4bdaa908ed74 video.mp4
+beam -k bbd76c292d2d3b447bd9775f07bf3d47 video.mp4
 
 # Use a specific IP or Tailscale domain for the link
 beam -H 192.168.1.50 -c video.mp4
@@ -110,7 +110,7 @@ beam -w video.mp4
 | `-t <ttl>` | Link lifetime. Default is `5h`. Accepts `s`, `m`, `h`, `d`. |
 | `-p` | Open an ephemeral public HTTPS tunnel via `cloudflared`. |
 | `-r` | Reopen and resume the last beamed file with its existing token. |
-| `-k <token>` | Use an explicit 12-character token hash. |
+| `-k <token>` | Use an explicit 32-character token hash. |
 | `-H <host>` | Host or IP for the share link (for example, `192.168.1.50` or `node.ts.net`). |
 | `-c` | Copy the share URL to the system clipboard. |
 | `-q` | Quiet mode. Suppress the terminal QR code. |
@@ -138,6 +138,11 @@ Requires a C99 compiler and `make`.
 make
 sudo make install
 ```
+
+Optional runtime dependencies:
+- `cloudflared` on `PATH` (or `BEAM_TUNNEL_BIN`) for `-p` public HTTPS tunnels.
+- `ffmpeg` on `PATH` for automatic MP4 faststart remuxing.
+- Clipboard utility (`clipbridge`, `wl-copy`, `xclip`, `pbcopy`, or `clip.exe`) for `-c`.
 
 To remove:
 
