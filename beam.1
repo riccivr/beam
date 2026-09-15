@@ -93,6 +93,15 @@ Force an MP4 faststart remux with ffmpeg so the index sits at the start of the f
 .B \-F
 Skip MP4 faststart remuxing.
 .TP
+.B \-s
+Re-encode the video to 720p H.264 + AAC 96k with ffmpeg before serving.
+Includes faststart. Intended for
+.B \-p
+playback.
+.TP
+.B \-S
+Re-encode to 480p H.264 + AAC 64k.
+.TP
 .B \-w
 Serve an HTML player wrapper instead of the raw media stream.
 .TP

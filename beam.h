@@ -30,6 +30,7 @@ typedef struct {
     bool resume_last;
     bool faststart;
     bool no_faststart;
+    int slim_height; /* 0 off, 720 (-s), 480 (-S) */
 
     time_t start_time;
     char public_url[1024];

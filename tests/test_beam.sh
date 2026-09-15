@@ -548,6 +548,34 @@ if command -v ffmpeg >/dev/null 2>&1; then
     fi
     kill $NOFS_PID 2>/dev/null || true
     wait $NOFS_PID 2>/dev/null || true
+
+    echo "Testing slim encode (-s)..."
+    SLIM_LOG="$TMP_DIR/slim.log"
+    ./beam -q -s -P 9886 -t 8s "$VALID_MP4" > "$SLIM_LOG" 2>&1 &
+    SLIM_PID=$!
+    for i in $(seq 1 20); do
+        if grep -q "serving slim MP4\|slim encode failed\|Link:" "$SLIM_LOG" 2>/dev/null; then
+            break
+        fi
+        sleep 0.3
+    done
+    if grep -q "serving slim MP4" "$SLIM_LOG"; then
+        SLIM_TOKEN=$(grep "Link:" "$SLIM_LOG" | grep -oE '[0-9a-f]{32}' | head -1)
+        SLIM_RESP=$(curl -s -i "http://127.0.0.1:9886/$SLIM_TOKEN")
+        if echo "$SLIM_RESP" | grep -q "video/mp4" && echo "$SLIM_RESP" | grep -q "HTTP/1.1 200 OK"; then
+            echo "[PASS] -s encodes and serves a slim MP4"
+        else
+            echo "[FAIL] -s response failed:"
+            echo "$SLIM_RESP"
+            kill $SLIM_PID 2>/dev/null || true
+            exit 1
+        fi
+    else
+        echo "[WARN] -s skipped or ffmpeg/libx264 unavailable"
+        cat "$SLIM_LOG"
+    fi
+    kill $SLIM_PID 2>/dev/null || true
+    wait $SLIM_PID 2>/dev/null || true
 fi
 
 echo "=== All tests passed successfully! ==="

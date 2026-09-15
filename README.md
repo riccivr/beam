@@ -49,8 +49,8 @@ I built beam because I use autodub to dub videos for my girlfriend and wanted a 
 Pipe autodub into beam. Beam prints the pipeline progress as it runs, picks the dubbed video file when finished, starts the server, and prints the link:
 
 ```sh
-# Share publicly over HTTPS tunnel
-autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+# Share publicly over HTTPS tunnel (slim 720p for playback)
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c -s
 
 # Share locally or across your LAN
 autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -c
@@ -76,8 +76,8 @@ While beam is running, you can also press `p` at any time to open or refresh the
 # Share a video locally (default 5h lifetime)
 beam video.mp4
 
-# Pipe from autodub and share over a public HTTPS tunnel
-autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c
+# Pipe from autodub and share a slim 720p copy over a public HTTPS tunnel
+autodub "https://www.youtube.com/watch?v=icsP8f8TRdQ" | beam -p -c -s
 
 # Reopen the last beamed file
 beam -p -c
@@ -118,6 +118,8 @@ beam -w video.mp4
 | `-w` | Serve an HTML player wrapper instead of the raw media stream. |
 | `-f` | Force an MP4 faststart remux via ffmpeg before serving. |
 | `-F` | Do not remux; serve the original MP4 as-is. |
+| `-s` | Slim re-encode to 720p H.264 + AAC 96k (`ffmpeg`, includes faststart). Use with `-p`. |
+| `-S` | Extra-slim re-encode to 480p H.264 + AAC 64k. |
 | `-b <ip>` | Bind IP address. Default is `0.0.0.0`. |
 | `-P <port>` | Port to listen on. Default is `8080` or the next available port. |
 | `-v` | Print version and exit. |

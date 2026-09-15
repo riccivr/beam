@@ -1253,6 +1253,80 @@ static bool remux_faststart(BeamConfig *cfg) {
     cfg->filesize = (int64_t)outst.st_size;
     return true;
 }
+
+static bool encode_slim(BeamConfig *cfg) {
+    char outpath[] = "/tmp/beam_slim_XXXXXX";
+    int fd, st;
+    pid_t pid;
+    struct stat outst;
+    char scale[64];
+    const char *crf;
+    const char *audio_br;
+
+    if (cfg->slim_height <= 480) {
+        crf = "26";
+        audio_br = "64k";
+    } else {
+        crf = "23";
+        audio_br = "96k";
+    }
+    snprintf(scale, sizeof(scale), "scale=-2:'min(%d,ih)'", cfg->slim_height);
+
+    fd = mkstemp(outpath);
+    if (fd < 0)
+        return false;
+    fchmod(fd, 0600);
+    close(fd);
+
+    pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("ffmpeg", "ffmpeg", "-nostdin", "-y", "-i", cfg->filepath,
+               "-vf", scale,
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", crf,
+               "-c:a", "aac", "-b:a", audio_br, "-ac", "2",
+               "-movflags", "+faststart", "-f", "mp4", outpath, (char *)NULL);
+        _exit(127);
+    }
+    if (waitpid(pid, &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        unlink(outpath);
+        return false;
+    }
+    if (stat(outpath, &outst) != 0 || outst.st_size <= 0) {
+        unlink(outpath);
+        return false;
+    }
+
+    if (global_faststart_file[0])
+        unlink(global_faststart_file);
+    snprintf(global_faststart_file, sizeof(global_faststart_file), "%s", outpath);
+    snprintf(cfg->filepath, sizeof(cfg->filepath), "%s", outpath);
+    cfg->filesize = (int64_t)outst.st_size;
+    cfg->mimetype = "video/mp4";
+    return true;
+}
+
+static bool maybe_slim(BeamConfig *cfg) {
+    if (cfg->slim_height <= 0)
+        return false;
+    if (!cfg->mimetype || strncmp(cfg->mimetype, "video/", 6) != 0)
+        return false;
+    fprintf(stderr, "beam: encoding slim %dp MP4 (libx264 veryfast)...\n", cfg->slim_height);
+    if (encode_slim(cfg)) {
+        fprintf(stderr, "beam: serving slim MP4 (%" PRId64 " bytes)\n", cfg->filesize);
+        return true;
+    }
+    fprintf(stderr, "beam: warning: slim encode failed (install ffmpeg with libx264); serving original file\n");
+    return false;
+}
 #endif
 
 static bool maybe_faststart(BeamConfig *cfg) {
@@ -1285,7 +1359,7 @@ static bool maybe_faststart(BeamConfig *cfg) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [-t ttl] [-p] [-r] [-k token] [-H host] [-c] [-q] [-1] [-w] [-f] [-F] [-b ip] [-P port] [file | -]\n", argv0);
+    fprintf(stderr, "usage: %s [-t ttl] [-p] [-r] [-k token] [-H host] [-c] [-q] [-1] [-w] [-f] [-F] [-s] [-S] [-b ip] [-P port] [file | -]\n", argv0);
     fprintf(stderr, "  -t ttl    Link lifetime (default: 5h; e.g. 30m, 2h, 300s)\n");
     fprintf(stderr, "  -p        Ephemeral public HTTPS tunnel via cloudflared (for remote sharing)\n");
     fprintf(stderr, "  -r        Reopen/resume last beamed file and link\n");
@@ -1297,6 +1371,8 @@ static void usage(void) {
     fprintf(stderr, "  -w        HTML web player page (default: native browser stream)\n");
     fprintf(stderr, "  -f        Force MP4 faststart remux (ffmpeg -movflags +faststart)\n");
     fprintf(stderr, "  -F        Skip MP4 faststart remux\n");
+    fprintf(stderr, "  -s        Slim encode: 720p H.264 + AAC 96k (ffmpeg, for -p)\n");
+    fprintf(stderr, "  -S        Extra-slim encode: 480p H.264 + AAC 64k\n");
     fprintf(stderr, "  -b ip     Bind IP address (default: 0.0.0.0)\n");
     fprintf(stderr, "  -P port   Listening port (default: 8080 or next available)\n");
     fprintf(stderr, "  -v        Show version\n");
@@ -1304,7 +1380,7 @@ static void usage(void) {
     fprintf(stderr, "  If no file is specified, beam reopens the last beamed file, or reads stdin.\n");
     fprintf(stderr, "  While running, press [p] to reopen tunnel, [c] to copy link, [q] to exit.\n");
     fprintf(stderr, "  Piping from autodub echoes progress and shares the dubbed video:\n");
-    fprintf(stderr, "    autodub \"https://www.youtube.com/watch?v=...\" | beam -p -c\n");
+    fprintf(stderr, "    autodub \"https://www.youtube.com/watch?v=...\" | beam -p -c -s\n");
     exit(1);
 }
 
@@ -1430,6 +1506,12 @@ int main(int argc, char *argv[]) {
         break;
     case 'F':
         cfg.no_faststart = true;
+        break;
+    case 's':
+        cfg.slim_height = 720;
+        break;
+    case 'S':
+        cfg.slim_height = 480;
         break;
     case 'b':
         snprintf(cfg.bind_ip, sizeof(cfg.bind_ip), "%s", EARGF(usage()));
@@ -1559,7 +1641,8 @@ int main(int argc, char *argv[]) {
     char saved_filepath[1024];
     snprintf(saved_filepath, sizeof(saved_filepath), "%s", cfg.filepath);
 
-    maybe_faststart(&cfg);
+    if (!maybe_slim(&cfg))
+        maybe_faststart(&cfg);
 
     if (!cfg.token[0]) {
         if (beam_generate_token(cfg.token, sizeof(cfg.token)) != 0) {
