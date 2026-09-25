@@ -691,6 +691,7 @@ static bool start_http_tunnel(int local_port, char *public_url_out, size_t maxle
     }
 
     close(pipefd[0]);
+    cleanup_tunnel();
     return false;
 }
 #endif
