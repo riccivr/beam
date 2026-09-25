@@ -321,10 +321,65 @@ static int evaluate_penalty(const QRMatrix *m) {
         }
     }
 
+    /* N3: 1:1:3:1:1 pattern with 4 light modules before or after */
+    for (int r = 0; r < size; r++) {
+        for (int c = 0; c <= size - 11; c++) {
+            if (m->modules[r][c]     == 1 && m->modules[r][c + 1]  == 0 &&
+                m->modules[r][c + 2] == 1 && m->modules[r][c + 3]  == 1 &&
+                m->modules[r][c + 4] == 1 && m->modules[r][c + 5]  == 0 &&
+                m->modules[r][c + 6] == 1 && m->modules[r][c + 7]  == 0 &&
+                m->modules[r][c + 8] == 0 && m->modules[r][c + 9]  == 0 &&
+                m->modules[r][c + 10] == 0) {
+                penalty += 40;
+            }
+            if (m->modules[r][c]     == 0 && m->modules[r][c + 1]  == 0 &&
+                m->modules[r][c + 2] == 0 && m->modules[r][c + 3]  == 0 &&
+                m->modules[r][c + 4] == 1 && m->modules[r][c + 5]  == 0 &&
+                m->modules[r][c + 6] == 1 && m->modules[r][c + 7]  == 1 &&
+                m->modules[r][c + 8] == 1 && m->modules[r][c + 9]  == 0 &&
+                m->modules[r][c + 10] == 1) {
+                penalty += 40;
+            }
+        }
+    }
+    for (int c = 0; c < size; c++) {
+        for (int r = 0; r <= size - 11; r++) {
+            if (m->modules[r][c]      == 1 && m->modules[r + 1][c]  == 0 &&
+                m->modules[r + 2][c]  == 1 && m->modules[r + 3][c]  == 1 &&
+                m->modules[r + 4][c]  == 1 && m->modules[r + 5][c]  == 0 &&
+                m->modules[r + 6][c]  == 1 && m->modules[r + 7][c]  == 0 &&
+                m->modules[r + 8][c]  == 0 && m->modules[r + 9][c]  == 0 &&
+                m->modules[r + 10][c] == 0) {
+                penalty += 40;
+            }
+            if (m->modules[r][c]      == 0 && m->modules[r + 1][c]  == 0 &&
+                m->modules[r + 2][c]  == 0 && m->modules[r + 3][c]  == 0 &&
+                m->modules[r + 4][c]  == 1 && m->modules[r + 5][c]  == 0 &&
+                m->modules[r + 6][c]  == 1 && m->modules[r + 7][c]  == 1 &&
+                m->modules[r + 8][c]  == 1 && m->modules[r + 9][c]  == 0 &&
+                m->modules[r + 10][c] == 1) {
+                penalty += 40;
+            }
+        }
+    }
+
+    /* N4: Proportion of dark modules */
+    int dark_count = 0;
+    for (int r = 0; r < size; r++) {
+        for (int c = 0; c < size; c++) {
+            if (m->modules[r][c]) dark_count++;
+        }
+    }
+    int total_modules = size * size;
+    int dark_pct = (dark_count * 100) / total_modules;
+    int diff = (dark_pct >= 50) ? (dark_pct - 50) : (50 - dark_pct);
+    penalty += (diff / 5) * 10;
+
     return penalty;
 }
 
 int qr_print_terminal(FILE *fp, const char *text) {
+    if (!fp || !text) return -1;
     gf_init();
 
     int len = (int)strlen(text);
@@ -337,7 +392,8 @@ int qr_print_terminal(FILE *fp, const char *text) {
         int header_bits = (v >= 10) ? (4 + 16) : (4 + 8);
         int total_data_bits = header_bits + len * 8;
         int max_data_bits = VINFO[v].data_bytes * 8;
-        if (total_data_bits <= max_data_bits) {
+        /* Reserve 4 terminator bits and ensure it fits in max_data_bits */
+        if (total_data_bits + 4 <= max_data_bits) {
             version = v;
             break;
         }
@@ -436,7 +492,7 @@ int qr_print_terminal(FILE *fp, const char *text) {
 
     /* 4. Render to terminal with quiet zone using Unicode half-blocks */
     int size = best_matrix.size;
-    int border = 2; /* Quiet zone border modules */
+    int border = 4; /* Quiet zone border modules (ISO/IEC 18004 specifies >= 4) */
 
     /*
      * We print inverted colors: \033[47;30m (white bg, black fg)
