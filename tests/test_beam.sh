@@ -578,4 +578,25 @@ if command -v ffmpeg >/dev/null 2>&1; then
     wait $SLIM_PID 2>/dev/null || true
 fi
 
+echo "Testing terminal QR code rendering..."
+QR_LOG="$TMP_DIR/qr_test.log"
+./beam -P 9887 -t 5s "$TEST_TXT" > "$QR_LOG" 2>&1 &
+QR_PID=$!
+for i in $(seq 1 20); do
+    if grep -q "Scan with camera:" "$QR_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 0.2
+done
+if grep -q "Scan with camera:" "$QR_LOG" && grep -q "Commands: \[p\]" "$QR_LOG"; then
+    echo "[PASS] Terminal QR code and interactive prompt rendered successfully"
+else
+    echo "[FAIL] Terminal QR code rendering failed:"
+    cat "$QR_LOG"
+    kill $QR_PID 2>/dev/null || true
+    exit 1
+fi
+kill $QR_PID 2>/dev/null || true
+wait $QR_PID 2>/dev/null || true
+
 echo "=== All tests passed successfully! ==="
