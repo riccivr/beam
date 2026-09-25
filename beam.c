@@ -392,6 +392,7 @@ bool beam_is_media(const char *mimetype) {
 }
 
 void beam_format_size(int64_t bytes, char *buf, size_t maxlen) {
+    if (!buf || maxlen == 0) return;
     const char *units[] = {"B", "KB", "MB", "GB", "TB"};
     int u = 0;
     double size = (double)bytes;
@@ -472,6 +473,7 @@ int beam_generate_token(char *token, size_t len) {
 }
 
 int beam_detect_local_ip(char *buf, size_t maxlen) {
+    if (!buf || maxlen == 0) return -1;
 #ifndef _WIN32
     struct ifaddrs *ifaddr, *ifa;
     char candidate[64] = "";
