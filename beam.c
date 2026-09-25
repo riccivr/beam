@@ -1247,8 +1247,10 @@ static bool remux_faststart(BeamConfig *cfg) {
         return false;
     }
 
-    if (global_faststart_file[0])
+    if (global_faststart_file[0]) {
         unlink(global_faststart_file);
+        global_faststart_file[0] = '\0';
+    }
     snprintf(global_faststart_file, sizeof(global_faststart_file), "%s", outpath);
     snprintf(cfg->filepath, sizeof(cfg->filepath), "%s", outpath);
     cfg->filesize = (int64_t)outst.st_size;
@@ -1306,8 +1308,10 @@ static bool encode_slim(BeamConfig *cfg) {
         return false;
     }
 
-    if (global_faststart_file[0])
+    if (global_faststart_file[0]) {
         unlink(global_faststart_file);
+        global_faststart_file[0] = '\0';
+    }
     snprintf(global_faststart_file, sizeof(global_faststart_file), "%s", outpath);
     snprintf(cfg->filepath, sizeof(cfg->filepath), "%s", outpath);
     cfg->filesize = (int64_t)outst.st_size;
